@@ -27,6 +27,6 @@ for i, x in enumerate(t):
 print(f"file '{d}/{len(t) - 1:04d}.png'")
 PY
   ffmpeg -loglevel error -y -f concat -safe 0 -i "$WORK/$theme.concat" \
-    -vf "fps=50,split[a][b];[a]palettegen=max_colors=128:stats_mode=full[p];[b][p]paletteuse=dither=sierra2_4a" \
+    -vf "fps=50,scale=1360:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128:stats_mode=full[p];[b][p]paletteuse=dither=sierra2_4a" \
     -loop 0 "$ROOT/docs/media/island-$theme.gif"
 done

@@ -24,20 +24,22 @@ final class FrameSink: NSObject, SCStreamOutput {
 
 /// The top of a MacBook lid: aluminium rim, rounded lid corners, black bezel, display
 /// with rounded top corners, wallpaper, and menu bar. The overlay hangs from the bezel.
-/// Proportions follow the MacBook Pro frame in devices.css (MIT, picturepan2).
+/// The display is 1512 points wide, the default resolution of a 14-inch MacBook Pro,
+/// so the notch and the overlay have their real size relative to the screen.
 struct MacTop: View {
     @ObservedObject var model: IslandModel
     let dark: Bool
     static let margin: CGFloat = 14
-    static let bezel: CGFloat = 13
-    static let lidWidth: CGFloat = 720
+    static let bezel: CGFloat = 16
+    static let display: CGFloat = 1512
+    static let lidWidth: CGFloat = display + bezel * 2
     static let width: CGFloat = lidWidth + margin * 2
     static func height(_ model: IslandModel) -> CGFloat { margin + bezel + model.notchHeight + 54 + 34 }
 
     var body: some View {
         let ink = dark ? Color.white : Color.black
         let page = dark ? Color(red: 0.05, green: 0.07, blue: 0.09) : Color.white
-        let lid = UnevenRoundedRectangle(topLeadingRadius: 26, topTrailingRadius: 26, style: .continuous)
+        let lid = UnevenRoundedRectangle(topLeadingRadius: 34, topTrailingRadius: 34, style: .continuous)
         ZStack(alignment: .top) {
             page
             ZStack(alignment: .top) {
@@ -49,6 +51,9 @@ struct MacTop: View {
                         : [Color(red: 0.84, green: 0.88, blue: 0.95), Color(red: 0.96, green: 0.92, blue: 0.94)],
                         startPoint: .topLeading, endPoint: .bottomTrailing)
                     HStack(spacing: 16) {
+                        Image(systemName: "apple.logo").font(.system(size: 15))
+                        Text("Finder").fontWeight(.bold)
+                        ForEach(["File", "Edit", "View", "Go", "Window", "Help"], id: \.self) { Text($0) }
                         Spacer()
                         RoundedRectangle(cornerRadius: 3.5, style: .continuous).stroke(ink, lineWidth: 1.5).frame(width: 13, height: 13)
                         Image(systemName: "wifi")
@@ -61,7 +66,7 @@ struct MacTop: View {
                     .frame(height: model.notchHeight)
                     .background(dark ? Color.black.opacity(0.18) : Color.white.opacity(0.32))
                 }
-                .clipShape(UnevenRoundedRectangle(topLeadingRadius: 14, topTrailingRadius: 14, style: .continuous))
+                .clipShape(UnevenRoundedRectangle(topLeadingRadius: 18, topTrailingRadius: 18, style: .continuous))
                 .padding([.top, .horizontal], Self.bezel)
                 IslandView(model: model).padding(.top, Self.bezel)
             }
