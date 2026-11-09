@@ -33,7 +33,7 @@ def main():
   url "{args.url}"
   name "Kou"
   desc "Local Mandarin dictation with a modifier-key shortcut"
-  homepage "https://github.com/sypsyp97/voice-input"
+  homepage "https://github.com/sypsyp97/kou"
 
   depends_on arch: :arm64
   depends_on macos: :sonoma

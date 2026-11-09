@@ -65,11 +65,6 @@ private final class RecorderSlot {
             guard AXIsProcessTrusted(), AVCaptureDevice.authorizationStatus(for: .audio) == .authorized else {
                 activity = L("需要麦克风和辅助功能权限", "Microphone and Accessibility access required"); return
             }
-            let legacy = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".cache/zh-voice/hammerspoon-heartbeat")
-            if let values = try? legacy.resourceValues(forKeys: [.contentModificationDateKey]),
-               let changed = values.contentModificationDate, Date().timeIntervalSince(changed) < 45 {
-                activity = L("另一个听写程序正在使用 fn+control，请先退出它", "Another dictation app uses fn+control. Quit it first."); return
-            }
             guard runtime.ready else { activity = L("模型尚未就绪", "Model is not ready"); return }
             enabled = true; activity = L("按 fn+control 开始听写", "Press fn+control to dictate")
             UserDefaults.standard.set(true, forKey: "enabled")

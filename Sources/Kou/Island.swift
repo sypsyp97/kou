@@ -70,50 +70,94 @@ private struct SpinRing: View {
     }
 }
 
-/// Completion: the arc slows and closes into a ring, the ring blooms into three
-/// staggered halos, the check mark springs in, and the label fades in after it.
-private struct DoneMark: View {
+/// Completion: the spinning arc slows and closes into a ring, one thin ring
+/// ripples outward and fades, and the check mark springs in.
+private struct DoneIcon: View {
     let start: Date
-    let label: String
 
     var body: some View {
         TimelineView(.animation) { context in
             let t = context.date.timeIntervalSince(start)
             let close = 0.26
-            let out = 1 - clamp01((t - 0.80) / 0.12)
-            HStack(spacing: 8) {
-                ZStack {
-                    if t < close {
-                        let p = t / close
-                        let angle = start.timeIntervalSinceReferenceDate * 300 + 300 * (t - 0.4 * t * t / close)
-                        Circle().stroke(accent.opacity(0.28 * (1 - p)), lineWidth: 2)
-                        Circle().trim(from: 0, to: (95 + 265 * (1 - (1 - p) * (1 - p))) / 360)
-                            .stroke(accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
-                            .rotationEffect(.degrees(angle.truncatingRemainder(dividingBy: 360)))
-                    } else {
-                        Circle().stroke(accent.opacity(1 - clamp01((t - close) / 0.14)), lineWidth: 2)
-                    }
-                    ForEach(0..<3, id: \.self) { index in
-                        let elapsed = t - [0.26, 0.30, 0.34][index]
-                        if elapsed >= 0 {
-                            let v = spring(elapsed, response: 0.42, damping: 0.80)
-                            let radius = 5.6 + ([10.0, 15.0, 21.0][index] - 5.6) * v
-                            let decay = 1 - clamp01((t - 0.54) / 0.22)
-                            Circle().fill(accent.opacity([0.30, 0.16, 0.07][index] * clamp01(v) * decay * out))
-                                .frame(width: radius * 2, height: radius * 2)
-                        }
-                    }
-                    if t >= 0.28 {
-                        let elapsed = t - 0.28
-                        Text("✓")
-                            .foregroundStyle(accent.opacity(0.38 + 0.62 * clamp01(elapsed / 0.26)))
-                            .scaleEffect(0.8 + 0.2 * spring(elapsed, response: 0.30, damping: 0.50))
-                            .opacity(clamp01(elapsed / 0.12) * out)
-                    }
+            ZStack {
+                if t < close {
+                    let p = t / close
+                    let angle = start.timeIntervalSinceReferenceDate * 300 + 300 * (t - 0.4 * t * t / close)
+                    Circle().stroke(accent.opacity(0.28 * (1 - p)), lineWidth: 2)
+                    Circle().trim(from: 0, to: (95 + 265 * (1 - (1 - p) * (1 - p))) / 360)
+                        .stroke(accent, style: StrokeStyle(lineWidth: 2, lineCap: .round))
+                        .rotationEffect(.degrees(angle.truncatingRemainder(dividingBy: 360)))
+                } else {
+                    Circle().stroke(accent.opacity(1 - clamp01((t - close) / 0.14)), lineWidth: 2)
                 }
-                .frame(width: 11.2, height: 11.2)
-                Text(label).lineLimit(1)
-                    .opacity((1 - pow(1 - clamp01((t - 0.34) / 0.20), 3)) * out)
+                if t >= close {
+                    let ripple = clamp01((t - close) / 0.5)
+                    let eased = 1 - pow(1 - ripple, 3)
+                    Circle().stroke(accent.opacity(0.55 * (1 - eased)), lineWidth: 1.2 * (1 - 0.6 * eased))
+                        .frame(width: 11.2 + 16 * eased, height: 11.2 + 16 * eased)
+                }
+                if t >= 0.28 {
+                    let elapsed = t - 0.28
+                    Text("✓")
+                        .foregroundStyle(accent)
+                        .scaleEffect(0.6 + 0.4 * spring(elapsed, response: 0.30, damping: 0.55))
+                        .opacity(clamp01(elapsed / 0.10))
+                }
+            }
+            .frame(width: 11.2, height: 11.2)
+        }
+    }
+}
+
+/// Blur, fade, and scale together, so content materializes instead of cutting in.
+private struct Materialize: ViewModifier {
+    let amount: CGFloat
+    func body(content: Content) -> some View {
+        content.blur(radius: 6 * amount).opacity(1 - amount).scaleEffect(1 - 0.06 * amount)
+    }
+}
+
+private extension AnyTransition {
+    static var materialize: AnyTransition {
+        .modifier(active: Materialize(amount: 1), identity: Materialize(amount: 0))
+    }
+}
+
+private let islandFont = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+
+/// A label whose old text dissolves while the new text materializes. The row
+/// keeps a measured width, so the icon beside it slides instead of jumping.
+private struct MorphLabel: View {
+    let text: String
+    var insertionDelay = 0.0
+
+    var body: some View {
+        let width = ceil((text as NSString).size(withAttributes: [.font: islandFont]).width)
+        ZStack(alignment: .leading) {
+            Text(text).lineLimit(1).fixedSize()
+                .id(text)
+                .transition(.asymmetric(
+                    insertion: .materialize.animation(.easeOut(duration: 0.24).delay(insertionDelay)),
+                    removal: .materialize.animation(.easeIn(duration: 0.12))))
+        }
+        .frame(width: width, alignment: .leading)
+        .animation(.spring(response: 0.36, dampingFraction: 0.86), value: width)
+    }
+}
+
+/// Live input level. The newest reading sits in the middle and older readings
+/// move outward on both sides.
+private struct Waveform: View {
+    let levels: [CGFloat]
+
+    var body: some View {
+        let half = 13
+        HStack(alignment: .center, spacing: 4) {
+            ForEach(0..<(half * 2), id: \.self) { index in
+                let distance = index < half ? half - 1 - index : index - half
+                let level = levels[levels.count - 1 - min(distance, levels.count - 1)]
+                Capsule().fill(accent.opacity(0.2 + 0.8 * level))
+                    .frame(width: 3, height: 4 + level * 20)
             }
         }
     }
@@ -121,46 +165,54 @@ private struct DoneMark: View {
 
 struct IslandView: View {
     @ObservedObject var model: IslandModel
+
+    /// Transcribing and done share one row, so the arc closes in place.
+    private enum Group { case recording, progress, message }
+    private var group: Group {
+        switch model.mode {
+        case .recording: return .recording
+        case .transcribing, .done: return .progress
+        case .message: return .message
+        }
+    }
+
     var body: some View {
         ZStack(alignment: .top) {
             NotchShape(progress: model.progress, closedWidth: model.notchWidth,
                        closedHeight: model.notchHeight).fill(.black)
-            Group {
-                switch model.mode {
+            ZStack {
+                switch group {
                 case .recording:
                     HStack(spacing: 12) {
-                        HStack(alignment: .center, spacing: 4) {
-                            ForEach(0..<26, id: \.self) { index in
-                                RoundedRectangle(cornerRadius: 1.5).fill(accent.opacity(0.3 + 0.7 * model.levels[index]))
-                                    .frame(width: 3, height: 3 + model.levels[index] * 20)
-                            }
-                        }
+                        Waveform(levels: model.levels)
                         Text(model.elapsed).monospacedDigit()
                     }
-                case .transcribing:
-                    HStack(spacing: 8) { SpinRing(); Text(L("转写中", "Transcribing")) }
-                case .done:
-                    DoneMark(start: model.doneStart, label: model.text)
+                    .transition(.materialize)
+                case .progress:
+                    HStack(spacing: 8) {
+                        if model.mode == .done { DoneIcon(start: model.doneStart) } else { SpinRing() }
+                        MorphLabel(text: model.mode == .done ? model.text : L("转写中", "Transcribing"),
+                                   insertionDelay: model.mode == .done ? 0.12 : 0)
+                    }
+                    .transition(.materialize)
                 case .message:
                     HStack(spacing: 8) {
                         if model.text.hasPrefix("✓") {
                             Text("✓")
-                            Text(model.text.dropFirst().trimmingCharacters(in: .whitespaces)).lineLimit(1)
+                            MorphLabel(text: model.text.dropFirst().trimmingCharacters(in: .whitespaces))
                         } else {
-                            Circle().fill(accent).frame(width: 9, height: 9)
-                            Text(model.text).lineLimit(1)
+                            Circle().fill(accent).frame(width: 7, height: 7)
+                            MorphLabel(text: model.text)
                         }
                     }
+                    .transition(.materialize)
                 }
             }
-            .id(model.mode)
-            .transition(.opacity)
-            .font(.system(size: 13, weight: .regular, design: .monospaced))
+            .font(Font(islandFont))
             .foregroundStyle(accent)
             .frame(height: 40)
             .padding(.top, model.notchHeight)
-            .opacity(model.contentVisible ? 1 : 0)
-            .scaleEffect(model.contentVisible ? 1 : 0.9, anchor: .top)
+            .modifier(Materialize(amount: model.contentVisible ? 0 : 1))
         }
         .frame(width: 344, height: model.notchHeight + 54, alignment: .top)
         .accessibilityLabel(model.mode == .recording ? L("录音中 \(model.elapsed)", "Recording \(model.elapsed)") : model.text)
@@ -212,8 +264,8 @@ final class IslandPanel: NSPanel {
         dismiss?.cancel(); reveal?.cancel()
         build()
         // Cross-fade between states; the completion animation continues the arc in place.
-        if mode == .done || !model.contentVisible { model.mode = mode; model.text = text }
-        else { withAnimation(.easeOut(duration: 0.18)) { model.mode = mode; model.text = text } }
+        if !model.contentVisible { model.mode = mode; model.text = text }
+        else { withAnimation(.easeOut(duration: 0.22)) { model.mode = mode; model.text = text } }
         panel?.orderFrontRegardless()
         withAnimation(.spring(response: 0.42, dampingFraction: 0.80)) { model.progress = 1 }
         let work = DispatchWorkItem { [weak self] in
