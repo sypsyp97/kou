@@ -232,11 +232,11 @@ def test_context_uses_the_measured_wrapper_not_a_bare_space_joined_list(harness)
     ctx = calls[0][calls[0].index("--context") + 1]
 
     assert ctx.startswith("Technical terms: "), (
-        "context 没有用实测有效的前缀，裸列表在难音频上比不给 context 还差：%r" % (ctx,))
-    assert ctx.endswith("."), "实测的那一版格式是以句号结尾的：%r" % (ctx,)
+        "context must start with the \"Technical terms: \" prefix; a bare list is worse than no context on hard audio: %r" % (ctx,))
+    assert ctx.endswith("."), "context must end with a period: %r" % (ctx,)
     body = ctx[len("Technical terms: "):-1]
     assert body.split(", ") == ["LIBERO", "sbatch", "mLSTM"], (
-        "术语要用逗号加空格分隔（照实测那一版），实际拆出来是 %r" % (body.split(", "),))
+        "terms must be separated by comma and space; got %r" % (body.split(", "),))
 
 
 # --- 56 ------------------------------------------------------------------
@@ -252,7 +252,7 @@ def test_a_terms_file_with_only_comments_passes_no_context_at_all(harness):
     calls = harness.calls("mlx-qwen3-asr")
     assert len(calls) == 1
     assert "--context" not in calls[0], (
-        "一个只有注释的术语表必须等于没有术语表，不能发一个空前缀出去：%r" % (calls[0],))
+        "a terms file with only comments must behave like no terms file, with no empty prefix sent: %r" % (calls[0],))
 
 
 # --- 57 ------------------------------------------------------------------
@@ -273,7 +273,7 @@ def test_multi_word_terms_are_kept_intact_and_duplicates_are_dropped(harness):
 
     assert terms == ["SLURM", "sbatch", "squeue", "Claude Code",
                      "speculative decoding"], (
-        "词组没保住或去重没生效，实际是 %r" % (terms,))
+        "phrases must be kept and duplicates removed; got %r" % (terms,))
 
 
 def test_terms_use_one_trimmed_line_per_term(harness):
@@ -344,10 +344,10 @@ def test_health_says_healthy_when_the_daemon_answers_ping(harness):
     assert r.returncode == 0, r.stderr
     assert "healthy" in r.stdout
     assert "stub/model" in r.stdout, (
-        "PONG 带回来的模型名要回显出来：它能分辨「daemon 活着」和「daemon 活着而且跑的"
-        "是我刚装的那一版」；实际输出 %r" % (r.stdout,))
+        "the model name from PONG must be echoed, so a live daemon can be told apart "
+        "from a live daemon running the installed model; got %r" % (r.stdout,))
     assert harness.calls("mlx-qwen3-asr") == [], (
-        "健康检查不能顺手起一次真转写：它要测的是服务活不活，不是能不能转写")
+        "a health check must not run a real transcription")
 
 
 # --- 48 ------------------------------------------------------------------
@@ -361,15 +361,15 @@ def test_doctor_reports_each_dependency_and_fails_on_a_missing_model(harness):
     r = harness.run(["--doctor"])
 
     assert "soxi" in r.stdout and "nc" in r.stdout, (
-        "体检要逐项列出依赖和它们的实际路径：%r" % (r.stdout,))
+        "doctor must list each dependency with its actual path: %r" % (r.stdout,))
     assert r.returncode != 0, (
-        "沙箱里没有模型缓存也没有 daemon，体检必须以非 0 退出")
+        "doctor must exit non-zero when there is no model cache and no daemon")
     assert "FAIL" in r.stdout and "model" in r.stdout, (
-        "缺模型缓存要明确报 FAIL：%r" % (r.stdout,))
+        "a missing model cache must be reported as FAIL: %r" % (r.stdout,))
     assert "zh-voice-audio" in r.stdout and "vad model" in r.stdout, (
-        "VAD 也要逐项体检：它坏了听写不会停（fail-open），只会静悄悄退回没有闸门的状态"
-        "——正因为无声，才必须能一眼查出来：%r" % (r.stdout,))
-    assert harness.calls("mlx-qwen3-asr") == [], "体检不能顺手跑一次转写"
+        "doctor must check VAD too: it fails open silently, so a broken VAD must be "
+        "visible here: %r" % (r.stdout,))
+    assert harness.calls("mlx-qwen3-asr") == [], "doctor must not run a transcription"
 
 
 # --- 39 ------------------------------------------------------------------
@@ -379,12 +379,12 @@ def test_health_fails_when_no_daemon_is_running(harness):
     r = harness.run(["--health"])
 
     assert r.returncode == 1, (
-        "没有 daemon 必须是失败退出，实际 rc=%s stdout=%r" % (r.returncode, r.stdout))
+        "no daemon must exit with failure; got rc=%s stdout=%r" % (r.returncode, r.stdout))
     assert "unhealthy" in r.stderr, r.stderr
-    assert harness.calls("mlx-qwen3-asr") == [], "健康检查不该退回一次性 CLI"
+    assert harness.calls("mlx-qwen3-asr") == [], "a health check must not fall back to the one-shot CLI"
     assert harness.daemon_launches(wait=0.5) == [], (
-        "--health 是只读探针，不能顺手把 daemon 拉起来：那会让检查本身改变被检查的"
-        "东西，deploy.sh 也就再也分不清服务是本来就活着，还是刚被它自己救活的")
+        "--health is a read-only probe and must not start the daemon, or the check "
+        "would change what it checks")
 
 
 # --- 40 ------------------------------------------------------------------
@@ -399,7 +399,7 @@ def test_health_fails_on_a_socket_with_nobody_behind_it(harness):
     r = harness.run(["--health"])
 
     assert r.returncode == 1, (
-        "socket 文件存在但没人应答，必须判成 unhealthy，实际 rc=%s stdout=%r"
+        "a socket file with no listener must be unhealthy; got rc=%s stdout=%r"
         % (r.returncode, r.stdout))
     assert "unhealthy" in r.stderr, r.stderr
 
@@ -423,11 +423,11 @@ def test_local_vad_rejects_silence_before_any_asr_path(harness):
     r = harness.run([wav], extra_env={"STUB_VAD_RESULT": "silence"})
 
     assert r.returncode == 0, r.stderr
-    assert r.stdout == "", "静音必须一个字都不输出，否则 init.lua 会把它粘出去"
-    assert r.stderr == "", "stderr 非空会被 init.lua 判成转写失败，那是另一个状态"
+    assert r.stdout == "", "silence must produce no stdout"
+    assert r.stderr == "", "silence must produce no stderr, since stderr output means a transcription failure"
     assert len(harness.calls("zh-voice-audio")) == 1
-    assert harness.calls("nc") == [], "静音不该占用 daemon"
-    assert harness.calls("mlx-qwen3-asr") == [], "静音更不该触发一次性 CLI"
+    assert harness.calls("nc") == [], "silence must not use the daemon"
+    assert harness.calls("mlx-qwen3-asr") == [], "silence must not trigger the one-shot CLI"
 
 
 # --- 50 ------------------------------------------------------------------
@@ -491,7 +491,7 @@ def test_term_list_echo_is_swallowed_not_pasted(harness):
     r = harness.run([wav], extra_env={"STUB_VAD_RESULT": "speech"})
 
     assert r.returncode == 0
-    assert r.stdout == "", "照着术语表念出来的东西不是人说的话，不能粘：%r" % (r.stdout,)
+    assert r.stdout == "", "a reply that only recites the glossary is not speech and must not be output: %r" % (r.stdout,)
     assert r.stderr == ""
 
 
@@ -520,8 +520,8 @@ def test_vad_is_asked_for_json_and_trim(harness):
 
     assert r.returncode == 0, r.stderr
     call = harness.calls("zh-voice-audio")[0]
-    assert "--json" in call, "没有 --json 就拿不到指标"
-    assert "--trim" in call, "没有 --trim 就不会裁静音"
+    assert "--json" in call, "--json is required to get metrics"
+    assert "--trim" in call, "--trim is required to trim silence"
 
 
 def test_vad_trim_can_be_turned_off(harness):
@@ -546,11 +546,11 @@ def test_metrics_record_numbers_but_never_the_transcript(harness, tmp_path):
 
     assert r.returncode == 0, r.stderr
     line = metrics.read_text()
-    assert secret not in line, "指标里出现了转写文本：%r" % (line,)
-    assert ".wav" not in line, "指标里出现了音频路径：%r" % (line,)
+    assert secret not in line, "metrics must not contain transcript text: %r" % (line,)
+    assert ".wav" not in line, "metrics must not contain the audio path: %r" % (line,)
     for key in ("ok=1", "path=daemon", "asr_ms=", "vad_p=0.97", "audio_ms=1500",
                 "trimmed_ms=980", "retry=0"):
-        assert key in line, "指标缺 %s：%r" % (key, line)
+        assert key in line, "metrics missing %s: %r" % (key, line)
 
 
 def test_metrics_distinguish_a_vad_gated_utterance(harness, tmp_path):
@@ -564,7 +564,7 @@ def test_metrics_distinguish_a_vad_gated_utterance(harness, tmp_path):
     assert r.returncode == 0 and r.stdout == ""
     line = metrics.read_text()
     assert "gated=1" in line, line
-    assert "vad_p=0.013" in line, "被拦时也要留下概率，否则没法判断是不是拦错了"
+    assert "vad_p=0.013" in line, "a gated clip must still record its probability"
 
 
 def test_reordered_term_echo_is_retried_without_context_and_recovered(harness):
@@ -589,7 +589,7 @@ def test_reordered_term_echo_is_retried_without_context_and_recovered(harness):
 
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "其实我说的是这句", \
-        "重试拿到了干净结果就该用它，而不是把回声丢了了事：%r" % (r.stdout,)
+        "a clean retry result must be used instead of dropping the echo: %r" % (r.stdout,)
 
 
 def test_term_echo_still_dropped_when_retry_is_also_an_echo(harness):
@@ -601,7 +601,7 @@ def test_term_echo_still_dropped_when_retry_is_also_an_echo(harness):
     r = harness.run([wav])
 
     assert r.returncode == 0
-    assert r.stdout == "", "两次都是回声还往外粘：%r" % (r.stdout,)
+    assert r.stdout == "", "when both attempts are echo, nothing must be output: %r" % (r.stdout,)
     assert r.stderr == ""
 
 
@@ -641,7 +641,7 @@ def test_speech_with_full_term_list_appended_is_retried_and_recovered(harness):
 
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "我们今天先把这个实验跑起来，然后看结果。", \
-        "贴尾回声该触发重试并救回真话：%r" % (r.stdout,)
+        "a trailing echo must trigger a retry that recovers the real speech: %r" % (r.stdout,)
 
 
 def test_real_speech_ending_with_a_short_term_list_is_not_an_echo(harness):
@@ -921,7 +921,7 @@ def test_cli_fallback_loads_the_pinned_snapshot_by_path(harness):
     calls = harness.calls("mlx-qwen3-asr")
     assert len(calls) == 1, calls
     got = calls[0][calls[0].index("--model") + 1]
-    assert got == str(snap), "--model 收到的是 %r，不是钉死的 snapshot 路径" % (got,)
+    assert got == str(snap), "--model must be the pinned snapshot path; got %r" % (got,)
 
 
 def test_cli_fallback_still_transcribes_when_the_pin_is_missing(harness):
@@ -936,7 +936,7 @@ def test_cli_fallback_still_transcribes_when_the_pin_is_missing(harness):
     assert r.stdout.strip() == "没钉住也照样出字"
     calls = harness.calls("mlx-qwen3-asr")
     assert calls[0][calls[0].index("--model") + 1] == "stub/model", (
-        "找不到钉死的 snapshot 时该退回 repo id：%r" % (calls[0],))
+        "without the pinned snapshot, --model must fall back to the repo id: %r" % (calls[0],))
 
 
 def test_doctor_reports_the_tokenizer_as_pinned_not_as_a_missing_upstream_cache(harness):
@@ -954,9 +954,9 @@ def test_doctor_reports_the_tokenizer_as_pinned_not_as_a_missing_upstream_cache(
     r = harness.run(["--doctor"], extra_env={"ZH_VOICE_ASR_REVISION": rev})
 
     line = [ln for ln in r.stdout.splitlines() if "tokenizer" in ln]
-    assert line, "体检没有 tokenizer 这一行：%r" % (r.stdout,)
+    assert line, "doctor output must have a tokenizer line: %r" % (r.stdout,)
     assert line[0].startswith("ok"), (
-        "钉得住却没报 ok（沙箱里根本没有上游缓存，这正是删掉之后的样子）：%r" % (line[0],))
+        "a pinnable tokenizer must be reported ok without an upstream cache: %r" % (line[0],))
 
 
 # ── Process spawns saved on the hot path ─────────────────────────────────────
@@ -975,8 +975,8 @@ def test_from_recorder_trusts_the_caller_and_skips_the_soxi_probes(harness):
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "不必再问格式"
     assert harness.calls("soxi") == [], (
-        "带 --from-recorder 还去问 soxi：热路径每轮白花三次 spawn")
-    assert harness.calls("ffmpeg") == [], "不该转码"
+        "--from-recorder must skip the soxi format probe")
+    assert harness.calls("ffmpeg") == [], "must not transcode"
 
 
 def test_without_the_flag_the_format_is_still_probed(harness):
@@ -992,7 +992,7 @@ def test_without_the_flag_the_format_is_still_probed(harness):
     r = harness.run([wav])
 
     assert r.returncode == 0, r.stderr
-    assert harness.calls("soxi") != [], "没带旗标时仍然必须探格式"
+    assert harness.calls("soxi") != [], "without the flag the format must still be probed"
 
 
 def test_server_reported_asr_ms_is_what_lands_in_metrics(harness, tmp_path):
@@ -1004,9 +1004,9 @@ def test_server_reported_asr_ms_is_what_lands_in_metrics(harness, tmp_path):
     r = harness.run([wav], extra_env={"ZH_VOICE_METRICS": str(metrics)})
 
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == "服务端计时的转写", "META 那一行不能被当成转写内容"
+    assert r.stdout.strip() == "服务端计时的转写", "the META line must not be treated as transcript"
     assert "asr_ms=137" in metrics.read_text(), (
-        "服务端报的耗时没进指标：%r" % (metrics.read_text(),))
+        "server ASR time must reach the metrics: %r" % (metrics.read_text(),))
 
 
 def test_a_reply_without_meta_still_yields_the_transcript(harness, tmp_path):
@@ -1020,7 +1020,7 @@ def test_a_reply_without_meta_still_yields_the_transcript(harness, tmp_path):
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "没有头信息的回复"
     assert "asr_ms=?" in metrics.read_text(), (
-        "拿不到服务端耗时就该记 ?，不能编一个数出来：%r" % (metrics.read_text(),))
+        "missing server ASR time must be recorded as ?, never invented: %r" % (metrics.read_text(),))
 
 
 def test_a_single_line_reply_that_looks_like_meta_is_not_eaten(harness):
@@ -1034,7 +1034,7 @@ def test_a_single_line_reply_that_looks_like_meta_is_not_eaten(harness):
 
     assert r.returncode == 0, r.stderr
     assert r.stdout.strip() == "META asr_ms=999", (
-        "单行回复必须原样当转写输出，实得 %r" % (r.stdout,))
+        "a single-line reply must be output unchanged as the transcript; got %r" % (r.stdout,))
 
 
 def test_terms_cache_is_read_back_and_an_edit_invalidates_it(harness):
@@ -1052,21 +1052,21 @@ def test_terms_cache_is_read_back_and_an_edit_invalidates_it(harness):
 
     r = harness.run([wav], extra_env={"STUB_ASR_STDOUT": "第一次"})
     assert r.returncode == 0, r.stderr
-    assert cache.exists(), "第一轮没写出缓存"
+    assert cache.exists(), "first run must write the cache"
 
     key = cache.read_text(encoding="utf-8").splitlines()[0]
     cache.write_text("%s\n哨兵术语\n哨兵术语\n" % key, encoding="utf-8")
     r = harness.run([wav], extra_env={"STUB_ASR_STDOUT": "第二次"})
     ctx = harness.calls("mlx-qwen3-asr")[-1]
     ctx = ctx[ctx.index("--context") + 1]
-    assert "哨兵术语" in ctx, "缓存没被读：context 里应该是哨兵，实得 %r" % (ctx,)
+    assert "哨兵术语" in ctx, "the cache must be read: context must hold the sentinel; got %r" % (ctx,)
 
     harness.write_terms("mLSTM\nGR00T\n")       # the edit makes terms.txt newer
     r = harness.run([wav], extra_env={"STUB_ASR_STDOUT": "第三次"})
     ctx = harness.calls("mlx-qwen3-asr")[-1]
     ctx = ctx[ctx.index("--context") + 1]
     assert "mLSTM" in ctx and "哨兵术语" not in ctx, (
-        "terms.txt 改了却还在用旧缓存：%r" % (ctx,))
+        "a changed terms.txt must invalidate the cache: %r" % (ctx,))
 
 
 def assert_corpus_record(archive, audio, transcript, context):

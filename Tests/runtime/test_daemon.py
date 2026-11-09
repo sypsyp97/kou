@@ -101,9 +101,9 @@ def test_malformed_request_gets_error_line_and_server_stays_alive(daemon_factory
 
     good = d.transcribe(str(wav))
     assert good.endswith("\n") and good.count("\n") == 2, (
-        "转写回复必须是 META 一行 + 转写一行：%r" % (good,))
+        "transcribe reply must be one META line plus one transcript line: %r" % (good,))
     head, transcript, _ = good.split("\n")
-    assert re.match(r"^META asr_ms=\d+$", head), "第一行不是服务端耗时：%r" % (head,)
+    assert re.match(r"^META asr_ms=\d+$", head), "first line must be server ASR time: %r" % (head,)
     assert transcript and not transcript.startswith("ERROR:")
 
     # (a) client vanishes before the reply is written
@@ -269,20 +269,20 @@ def test_wedged_transcription_makes_the_daemon_exit_so_launchd_replaces_it(
     reply = d.transcribe(str(wav), timeout=20)
 
     assert reply.startswith("ERROR:"), (
-        "卡死必须当场回一句 ERROR，而不是让客户端等到超时或 EOF；实际收到 %r\n%s"
+        "a hang must reply ERROR at once, not leave the client waiting for timeout or EOF; got %r\n%s"
         % (reply, d.output()))
-    assert "转写卡死" in reply, "ERROR 要说清是卡死，不是别的失败：%r" % (reply,)
+    assert "转写卡死" in reply, "ERROR must say it is a hang, not another failure: %r" % (reply,)
 
     assert wait_gone(d.proc, 20), (
-        "回了 ERROR 之后 daemon 必须自己退出。KeepAlive 不会替它做这个判断，socket 也"
-        "还在，外面没有任何东西看得出服务已经死了\n%s" % d.output())
+        "daemon must exit by itself after replying ERROR: KeepAlive cannot tell, "
+        "and the socket stays, so nothing outside shows the service is dead\n%s" % d.output())
     assert d.proc.returncode == 70, (
-        "卡死退出要用一个非 0 码（70 = EX_SOFTWARE），好在 launchd 日志里跟正常收尾"
-        "区分开；实际 rc=%s\n%s" % (d.proc.returncode, d.output()))
+        "hang exit must use a non-zero code (70 = EX_SOFTWARE) to differ from a "
+        "normal exit in the launchd log; got rc=%s\n%s" % (d.proc.returncode, d.output()))
     assert not d.sock.exists(), (
-        "退出这条路必须 unlink socket，否则客户端会对着一个空壳 socket 再白等一次 90 s")
+        "the exit path must unlink the socket, or the client waits 90 s on a dead socket")
     assert "转写卡死" in d.output(), (
-        "卡死退出必须在日志里留下原因，否则 launchd 里只看到一次无由来的重启\n%s"
+        "a hang exit must log its reason, or launchd shows an unexplained restart\n%s"
         % d.output())
 
 
@@ -300,19 +300,19 @@ def test_ping_is_answered_without_touching_the_model(daemon_factory):
     reply = d.request("PING\n\n")
 
     assert reply.startswith("PONG"), (
-        "PING 必须原地答 PONG，deploy.sh 拿这个当上线闸门；实际收到 %r" % (reply,))
+        "PING must be answered with PONG in place (health gate); got %r" % (reply,))
     assert "stub/model" in reply, (
-        "PONG 要带上当前加载的模型，好让 deploy 顺手确认跑的是它装的那一个（而不是"
-        "上一版残留的 daemon）；实际收到 %r" % (reply,))
-    assert reply.count("\n") == 1, "还是一行一个回复：%r" % (reply,)
+        "PONG must include the loaded model so the caller can confirm it is the "
+        "intended one, not a leftover daemon; got %r" % (reply,))
+    assert reply.count("\n") == 1, "reply must stay one line: %r" % (reply,)
     assert len(d.asr_calls()) == before, (
-        "PING 跑了一次真转写（%d -> %d）：健康检查不该有副作用，也不该在模型忙的时候"
-        "跟真请求抢那根线程" % (before, len(d.asr_calls())))
+        "PING ran a real transcription (%d -> %d): a health check must have no side "
+        "effects and must not compete with real requests for the model thread" % (before, len(d.asr_calls())))
     assert d.alive()
 
     wav = write_wav(d.tmp / "clip.wav", 0.5)
     assert not d.transcribe(str(wav)).startswith("ERROR:"), (
-        "PING 之后必须还能正常服务")
+        "daemon must keep serving after PING")
 
 
 # --- 46 ------------------------------------------------------------------
@@ -335,15 +335,16 @@ def test_the_model_lives_in_a_separate_process_from_the_socket(daemon_factory):
                               capture_output=True, text=True)
     kids = [line for line in children.stdout.split() if line.strip()]
     assert kids, (
-        "daemon 没有子进程：模型跟 socket 住在同一个进程里，卡死时就只能靠赌 GIL 会不会"
-        "被释放\n%s" % d.output())
+        "daemon has no child process: model and socket share one process, so a hang "
+        "depends on the GIL being released\n%s" % d.output())
 
     source = ZH_VOICE_DAEMON.read_text(encoding="utf-8")
     top_level = [line for line in source.splitlines()
                  if re.match(r"^(import|from)\s+mlx", line)]
     assert not top_level, (
-        "mlx 在模块顶层被 import 了：%r。spawn 会把这个文件重新 import 一遍，写在顶层"
-        "等于父进程也要付一次 3.4 GB 的加载，而父进程存在的全部意义就是不碰 Metal"
+        "mlx must not be imported at module top level: %r. spawn re-imports this "
+        "file, so the parent would also pay a 3.4 GB load, and the parent must "
+        "never touch Metal"
         % (top_level,))
 
 
@@ -362,13 +363,13 @@ def test_empty_transcript_is_retried_without_the_term_bias(daemon_factory):
     reply = d.transcribe(str(wav), context="LIBERO sbatch mLSTM")
 
     assert reply.strip() and not reply.startswith("ERROR:"), (
-        "带术语表出不来字时必须退掉术语表重试，而不是把空结果交给用户：%r" % (reply,))
+        "when the glossary yields no text, retry without it instead of returning an empty result: %r" % (reply,))
     calls = d.asr_calls()[before:]
     assert len(calls) == 2, (
-        "应该正好两次转写：一次带 context，一次不带。实际 %d 次：%r"
+        "expected exactly two transcriptions, one with context and one without; got %d: %r"
         % (len(calls), calls))
-    assert calls[0]["context"], "第一次必须仍然带上术语表（它平时是有用的）"
-    assert not calls[1]["context"], "重试那次必须不带术语表，否则重试没有意义"
+    assert calls[0]["context"], "first attempt must still carry the glossary"
+    assert not calls[1]["context"], "retry must not carry the glossary"
 
 
 # --- 75 --- the pinned revision must take effect at run time ---------------
@@ -390,9 +391,9 @@ def test_pinned_snapshot_path_is_what_actually_gets_loaded(daemon_factory, tmp_p
     reply = d.request("PING\n\n")
 
     assert "rev=" + "b" * 40 in reply, (
-        "PONG 没有回显真正加载的 revision，deploy 就没法验证钉子钉住了：%r" % (reply,))
+        "PONG must echo the loaded revision so the pin can be verified: %r" % (reply,))
     loaded = [c for c in d.asr_calls()]
-    assert loaded, "worker 连预热都没跑？"
+    assert loaded, "worker did not even run warm-up"
 
 
 def test_an_unusable_pin_says_unpinned_out_loud_instead_of_pretending(
@@ -411,10 +412,10 @@ def test_an_unusable_pin_says_unpinned_out_loud_instead_of_pretending(
     reply = d.request("PING\n\n")
 
     assert "rev=unpinned" in reply, (
-        "用不上的钉子必须报 unpinned，否则 deploy 会把一次漂移验成成功：%r" % (reply,))
+        "an unusable pin must report unpinned, or drift passes verification: %r" % (reply,))
     log = d.stdout_path.read_text(encoding="utf-8", errors="replace")
     assert "ZH_VOICE_MODEL_PATH" in log, (
-        "退回 repo id 这件事在日志里一个字都没有：%r" % (log[:400],))
+        "the fallback to the repo id must be logged: %r" % (log[:400],))
 
 
 # --- 77 --- the tokenizer must also come from the pinned snapshot -------------
@@ -436,12 +437,12 @@ def test_tokenizer_is_pinned_to_the_snapshot_we_loaded(daemon_factory, tmp_path)
     reply = d.request("PING\n\n")
 
     assert "tok=pinned" in reply, (
-        "PONG 没报 tok=pinned，deploy 就没法确认线上那个钉子真的钉上了：%r" % (reply,))
+        "PONG must report tok=pinned so the tokenizer pin can be verified: %r" % (reply,))
     calls = d.asr_calls()
-    assert calls, "worker 连预热都没转写过？"
+    assert calls, "worker did not transcribe even during warm-up"
     assert calls[0]["tokenizer_from"] == str(snap), (
-        "**预热那一次**转写时词表还指着 %r —— 钉子必须在任何一次 transcribe 之前生效，"
-        "warm_up 也算" % (calls[0]["tokenizer_from"],))
+        "the warm-up transcription used tokenizer %r: the pin must apply before any "
+        "transcribe call, warm_up included" % (calls[0]["tokenizer_from"],))
 
 
 def test_an_unpinnable_target_says_upstream_instead_of_pretending(
@@ -460,9 +461,9 @@ def test_an_unpinnable_target_says_upstream_instead_of_pretending(
     reply = d.request("PING\n\n")
 
     assert "tok=upstream" in reply, (
-        "没有词表文件的 snapshot 是钉不住的，PONG 必须说 upstream：%r" % (reply,))
+        "a snapshot without tokenizer files cannot be pinned; PONG must say upstream: %r" % (reply,))
     log = d.stdout_path.read_text(encoding="utf-8", errors="replace")
-    assert "词表" in log, "钉不住这件事在日志里一个字都没有：%r" % (log[:400],)
+    assert "词表" in log, "the failed pin must be logged: %r" % (log[:400],)
 
 
 def test_the_pin_uses_the_module_from_sys_modules_not_the_reexported_function():
@@ -473,11 +474,11 @@ def test_the_pin_uses_the_module_from_sys_modules_not_the_reexported_function():
     """
     code = ZH_VOICE_DAEMON.read_text(encoding="utf-8")
     body = re.search(r"def pin_tokenizer_dir\(target\):(.*?)\ndef ", code, re.S)
-    assert body, "找不到 pin_tokenizer_dir"
+    assert body, "pin_tokenizer_dir not found"
     # Look only at the lines that execute. The docstring deliberately contains the
     # wrong form as a warning, and matching it would make this assertion always fail.
     statements = body.group(1).split('"""')[-1]
     assert "sys.modules" in statements, (
-        "钉子没走 sys.modules，那它大概率钉在了 re-export 出来的那个函数身上")
+        "the pin must go through sys.modules, not a re-exported function")
     assert not re.search(r"import\s+mlx_qwen3_asr\.transcribe\s+as", statements), (
-        "这种写法拿到的是函数，不是模块")
+        "this form imports the function, not the module")
