@@ -12,6 +12,12 @@ static volatile sig_atomic_t child_pid;
 static void stop(int sig) { stop_signal = sig; }
 static void begin_capture(int sig) { (void)sig; if (child_pid > 0) kill(-child_pid, SIGUSR1); }
 static void child_changed(int sig) { (void)sig; }
+// Deadlines use the clock, not loop counts: a loaded machine can oversleep each interval.
+static double now(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec + t.tv_nsec / 1e9;
+}
 
 int main(int argc, char **argv) {
     if (argc < 2) return 64;
@@ -38,21 +44,22 @@ int main(int argc, char **argv) {
         _exit(127);
     }
     child_pid = child;
-    int status = 0, stopping = 0;
+    int status = 0;
+    double kill_at = 0;
     struct timespec interval = {0, 100000000};
     while (1) {
         pid_t result = waitpid(child, &status, WNOHANG);
         if (result == child) break;
         if (result < 0 && errno != EINTR) return 71;
         if (getppid() != owner || stop_signal) {
-            if (stopping == 0) kill(-child, SIGTERM);
-            if (++stopping >= 25) kill(-child, SIGKILL);
+            if (kill_at == 0) { kill(-child, SIGTERM); kill_at = now() + 2.5; }
+            else if (now() >= kill_at) kill(-child, SIGKILL);
         }
         nanosleep(&interval, NULL);
     }
     // A shell can exit before its descendants. Do not leave those behind.
     kill(-child, SIGTERM);
-    for (int i = 0; i < 10 && kill(-child, 0) == 0; ++i) nanosleep(&interval, NULL);
+    for (double end = now() + 1.0; now() < end && kill(-child, 0) == 0;) nanosleep(&interval, NULL);
     kill(-child, SIGKILL);
     // A successful signal does not mean the kernel has drained the group.
     while (1) {
