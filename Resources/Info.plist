@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleDevelopmentRegion</key><string>en</string>
+  <key>CFBundleLocalizations</key><array><string>en</string><string>zh-Hans</string></array>
+  <key>CFBundleIdentifier</key><string>io.github.sypsyp97.Kou</string>
+  <key>CFBundleName</key><string>Kou</string>
+  <key>CFBundleDisplayName</key><string>Kou</string>
+  <key>CFBundleExecutable</key><string>Kou</string>
+  <key>CFBundleIconFile</key><string>Kou</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>LSUIElement</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>Kou uses your microphone for local dictation. Audio stays on this Mac.</string>
+  <key>NSHighResolutionCapable</key><true/>
+</dict></plist>

@@ -1,0 +1,32 @@
+#!/usr/bin/env python3
+"""Stub `ffmpeg`: records the invocation and writes a 16 kHz mono wav of the
+same duration as the input, so the caller can carry on as if it transcoded."""
+import json
+import os
+import sys
+import wave
+
+argv = sys.argv[1:]
+_log = os.environ.get("STUB_LOG_DIR")
+if _log:
+    with open(os.path.join(_log, "ffmpeg.log"), "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+src = None
+if "-i" in argv:
+    src = argv[argv.index("-i") + 1]
+dst = argv[-1]
+
+seconds = 1.0
+if src:
+    try:
+        with wave.open(src, "rb") as w:
+            seconds = w.getnframes() / float(w.getframerate() or 16000)
+    except Exception:
+        seconds = 1.0
+
+with wave.open(dst, "wb") as w:
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(16000)
+    w.writeframes(b"\x01\x00" * max(1, int(16000 * seconds)))

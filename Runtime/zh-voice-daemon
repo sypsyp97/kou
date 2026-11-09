@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""Resident Qwen3-ASR server.
+
+Loading Qwen3-ASR-1.7B costs ~0.8-1.2 s, which the one-shot CLI paid on every
+hotkey press. This keeps the model in RAM and answers over a unix socket:
+measured 1.83 s -> 1.06 s on a 3.5 s clip.
+
+Protocol, plain text, one request per connection:
+  ->  <wav path>\n<context terms>\n
+  <-  <transcript>\n        (or  ERROR: ...\n)
+  ->  PING\n\n
+  <-  PONG <model>\n        健康探针，不碰模型
+
+两层进程，理由见 worker_main：模型住在一个可丢弃的子进程里，这个父进程只管 socket
+和超时。Exits after ZH_VOICE_IDLE seconds idle so it does not hold ~3.4 GB forever;
+exits 70 when the worker misses its deadline, so launchd brings up a fresh one.
+
+shebang 故意写成 env python3：源文件要能被任意 python 语法检查、也要能在测试里用
+系统 python 跑。deploy.sh 安装时会把第一行换成 uv tool 那个精确的解释器。
+"""
+import atexit
+from contextlib import contextmanager
+import fcntl
+import multiprocessing
+import os
+import signal
+import socket
+import sys
+import tempfile
+import threading
+import time
+from types import MethodType
+import wave
+
+# 运行期不该碰网络。模型是安装阶段备好的，这里钉死离线，免得 HF 在断网/弱网时把一次
+# 转写拖成几十秒的超时重试——那正好会被下面的预算判成卡死。
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+SOCK_PATH = os.path.expanduser(os.environ.get(
+    "ZH_VOICE_SOCKET", "~/.cache/zh-voice/asr.sock"))
+MODEL = os.environ.get("ZH_VOICE_MODEL", "mlx-community/Qwen3-ASR-1.7B-8bit")
+# 运行期真正加载哪个目录。deploy.sh 把钉死的 snapshot 路径渲染进 plist —— 光把 repo id
+# 交给 huggingface_hub 是**钉不住版本的**：offline 模式下它去读 refs/main，那是"缓存里
+# 最近一次拉到的那一版"，和我们钉的 ASR_REVISION 并不是同一件事。两者一分开（上游更新
+# 过一次就会），deploy 的预检照样通过（它只查那个目录还在不在），而线上悄悄换成了另一份
+# 权重——症状是"转写忽然变差"，属于最难查的那一类。
+MODEL_PATH = os.environ.get("ZH_VOICE_MODEL_PATH", "")
+IDLE_SEC = float(os.environ.get("ZH_VOICE_IDLE", "3600"))
+
+# 请求读取上限：accept 循环是单线程的，一个半开着不说话的客户端能把所有人堵死。
+# 客户端（nc）握手后立刻把两行写完，正常路径连一毫秒都用不到。
+READ_TIMEOUT_SEC = 2.0
+# 一个不肯发换行的客户端能让 buf 无限长。正常请求是一个路径加一行术语表，64 KiB 绰绰有余。
+MAX_REQUEST_BYTES = 64 * 1024
+# Bound retained KV storage for unusually long context strings.
+MAX_PREFIX_TOKENS = 1024
+
+# worker 冷启动要把 3.4 GB 权重读进来，给足；超过就是真起不来了。
+WORKER_START_TIMEOUT_SEC = float(os.environ.get("ZH_VOICE_START_TIMEOUT", "180"))
+
+# 一次转写允许的墙钟预算 = BASE + FACTOR × 音频秒数，夹在 [FLOOR, CEIL] 之间。
+# 实测热态 3.5s 音频 1.06s，FACTOR=4 是给"整机被重负载拖住"留的四倍余量：宁可多等，
+# 也不能把一句说完的话在正常情况下判成卡死。固定超时在这里不合适——录音上限是 120s，
+# 一个对短句合适的固定值会在长句上例行误杀。
+# CEIL 反过来：卡死期间客户端会退回一次性 CLI，那边再加载一份 3.4 GB，两份同时占着
+# 内存比多等一会儿更糟，所以最长也就等 3 分钟。
+HANG_BASE = float(os.environ.get("ZH_VOICE_HANG_BASE", "10"))
+HANG_FACTOR = float(os.environ.get("ZH_VOICE_HANG_FACTOR", "4"))
+HANG_FLOOR = float(os.environ.get("ZH_VOICE_HANG_FLOOR", "25"))
+HANG_CEIL = float(os.environ.get("ZH_VOICE_HANG_CEIL", "180"))
+
+last_used = time.time()
+_worker = None
+_server = None
+_health_server = None
+_loaded_from = ""        # worker 报回来的"我真的从这儿加载的"，PONG 要回显它
+_tokenizer_pinned = False   # 词表也来自那个 snapshot 吗（见 pin_tokenizer_dir）
+
+
+def model_target():
+    """交给 load_model 的东西。它的形参就叫 path_or_hf_repo：本地目录（且带 config.json）
+    直接用，否则退回 repo id 让 huggingface_hub 走 refs/main。
+
+    退回是故意的：钉死的路径不在时宁可用缓存里那一版出字，也不要整条链路停摆。真正该拦住
+    版本漂移的是 deploy 的验活——它会拿 PONG 里的 rev= 和自己钉的 revision 对账，所以这个
+    退路不会变成一个**没人看得见**的退路。"""
+    if MODEL_PATH and os.path.isfile(os.path.join(MODEL_PATH, "config.json")):
+        return MODEL_PATH
+    return MODEL
+
+
+def pin_tokenizer_dir(target):
+    """让词表也从 target 读，而不是上游 DEFAULT_MODEL_ID 那个仓库（transcribe() 拿到一个
+    已加载的 model 对象时用的是后者）。句柄必须从 sys.modules 取：
+    `import mlx_qwen3_asr.transcribe as T` 拿到的是 re-export 的**函数**，设属性静默失效。
+    钉不住返回 False，由 deploy 预检兜住。"""
+    for name in ("vocab.json", "merges.txt", "tokenizer_config.json"):
+        if not os.path.isfile(os.path.join(target, name)):
+            return False        # 不是一个自带词表的本地 snapshot：没得钉
+    module = sys.modules.get("mlx_qwen3_asr.transcribe")
+    if module is None or not hasattr(module, "DEFAULT_MODEL_ID"):
+        return False
+    module.DEFAULT_MODEL_ID = target
+    return True
+
+
+def revision_label():
+    """PONG 里那个 rev=：真正加载的 snapshot 目录名，也就是 HF 的 commit hash。
+    没钉住就说 unpinned，不假装钉住了。"""
+    if _loaded_from and _loaded_from != MODEL:
+        return os.path.basename(os.path.normpath(_loaded_from))
+    return "unpinned"
+
+
+def hang_budget(wav):
+    """这一段音频允许转写多久。读不出时长（文件不存在、不是 wav）就退回 FLOOR：
+    这条路上的请求马上要在 worker 里报错，预算给多少都无所谓。
+
+    在父进程里算，不在 worker 里算：算预算的那一方必须是**不会跟着卡死**的那一方。"""
+    try:
+        with wave.open(wav, "rb") as w:
+            dur = w.getnframes() / float(w.getframerate() or 16000)
+    except Exception:
+        dur = 0.0
+    return max(HANG_FLOOR, min(HANG_CEIL, HANG_BASE + HANG_FACTOR * dur))
+
+
+def watchdog():
+    """Release the ~3.4 GB after IDLE_SEC of quiet.
+
+    The poll has to be fine-grained relative to the timeout, not a fixed 30 s:
+    with a coarse sleep a small ZH_VOICE_IDLE is simply unreachable, because the
+    first check does not even happen until long after it has expired.
+
+    Never called when IDLE_SEC <= 0 (see main): that is the resident mode, and
+    with a non-positive timeout the poll would degenerate to a 0.05 s spin that
+    exits on the very first tick.
+    """
+    poll = max(0.05, min(5.0, IDLE_SEC / 20.0))
+    while True:
+        time.sleep(poll)
+        if time.time() - last_used > IDLE_SEC:
+            cleanup()          # os._exit skips atexit, so unlink the socket here
+            os._exit(0)
+
+
+def warm_up(model, q):
+    """MLX materialises weights lazily, so the first real request would otherwise
+    pay for it. Burn that cost here on a scrap of silence instead.
+
+    Scratch file goes under $TMPDIR with a unique name: a fixed /tmp path is
+    shared with every other user and with the daemon that is already running, so
+    two starts race on the same bytes.
+    """
+    fd, path = tempfile.mkstemp(prefix="zh-voice-warmup-", suffix=".wav")
+    os.close(fd)
+    try:
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(b"\x00" * 16000)
+        try:
+            q.transcribe(path, model=model, language="Chinese")
+        except Exception:
+            pass
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+class FixedPrefixPrefill:
+    """Reuse immutable text-prefix KV within one serial inference worker."""
+
+    def __init__(self, model, tokenizer, context):
+        import mlx.core as mx
+
+        self.mx = mx
+        self.model = model
+        self.original_prefill = None
+        self.active = False
+        self.hits = 0
+        self.fallbacks = 0
+        self.cached = None
+        self.build_ms = 0.0
+        self.prefix_tokens = 0
+        self.prefix_ids = []
+        prefill = model.prefill
+        if not isinstance(prefill, MethodType) or prefill.__self__ is not model:
+            return
+        self.original_prefill = prefill.__func__
+        prompt = tokenizer.build_prompt_tokens(
+            n_audio_tokens=1, language="Chinese", context=context,
+        )
+        if tokenizer.AUDIO_TOKEN_ID not in prompt:
+            return
+        self.prefix_tokens = prompt.index(tokenizer.AUDIO_TOKEN_ID)
+        self.prefix_ids = prompt[:self.prefix_tokens]
+        if not 0 < self.prefix_tokens <= MAX_PREFIX_TOKENS:
+            return
+
+        mx.synchronize()
+        started = time.perf_counter()
+        positions = mx.arange(self.prefix_tokens)[None, :]
+        self.prefix_positions = mx.stack([positions, positions, positions], axis=1)
+        self.position_values = self.prefix_positions.tolist()
+        self.cached = model.create_cache(max_seq_len=self.prefix_tokens)
+        model.model(
+            input_ids=mx.array([self.prefix_ids]),
+            position_ids=self.prefix_positions,
+            cache=self.cached,
+        )
+        mx.eval(self.cached.keys, self.cached.values)
+        mx.synchronize()
+        self.build_ms = (time.perf_counter() - started) * 1000
+
+    def prefill(self, instance, input_ids, audio_features, position_ids, cache):
+        mx = self.mx
+        length = self.prefix_tokens
+        compatible = (
+            self.cached is not None
+            and instance is self.model
+            and input_ids.ndim == 2
+            and input_ids.shape[0] == 1
+            and input_ids.shape[1] > length
+            and position_ids.shape == (1, 3, input_ids.shape[1])
+            and position_ids.dtype == self.prefix_positions.dtype
+            and cache.offset == 0
+            and cache.max_seq_len is not None
+            and cache.max_seq_len >= input_ids.shape[1]
+        )
+        if compatible:
+            compatible = (
+                input_ids[0, :length].tolist() == self.prefix_ids
+                and position_ids[:, :, :length].tolist() == self.position_values
+            )
+        if not compatible:
+            self.fallbacks += 1
+            return self.original_prefill(
+                instance, input_ids=input_ids, audio_features=audio_features,
+                position_ids=position_ids, cache=cache,
+            )
+
+        # Keep the request's capacity. A prefix-only fork cannot append tokens.
+        for index, (key, value) in enumerate(
+            zip(self.cached.keys, self.cached.values, strict=True)
+        ):
+            if key is None or value is None:
+                raise RuntimeError("Fixed-prefix cache has an unpopulated layer")
+            key_buffer = mx.zeros(
+                (key.shape[0], key.shape[1], cache.max_seq_len, key.shape[3]),
+                dtype=key.dtype,
+            )
+            value_buffer = mx.zeros(
+                (value.shape[0], value.shape[1], cache.max_seq_len, value.shape[3]),
+                dtype=value.dtype,
+            )
+            key_buffer[..., :length, :] = key
+            value_buffer[..., :length, :] = value
+            cache.keys[index] = key_buffer
+            cache.values[index] = value_buffer
+        cache.offset = length
+        self.hits += 1
+        return self.original_prefill(
+            instance,
+            input_ids=input_ids[:, length:],
+            audio_features=audio_features,
+            position_ids=position_ids[:, :, length:],
+            cache=cache,
+        )
+
+    @contextmanager
+    def enabled(self):
+        if self.cached is None:
+            yield self
+            return
+        if self.active:
+            raise RuntimeError("Fixed-prefix cache contexts cannot nest")
+        model_type = type(self.model)
+        if model_type.prefill is not self.original_prefill:
+            raise RuntimeError("Model prefill changed before cache activation")
+
+        def replacement(instance, *args, **kwargs):
+            return self.prefill(instance, *args, **kwargs)
+
+        self.active = True
+        model_type.prefill = replacement
+        try:
+            yield self
+        finally:
+            model_type.prefill = self.original_prefill
+            self.active = False
+
+
+def worker_main(pipe):
+    """把 MLX 关在一个可丢弃的子进程里。
+
+    这是整个文件最重要的一个决定。一次 Metal 调用可以挂住而不杀死 Python，如果推理跑在
+    socket 进程里，就只剩两种烂选择：要么 launchd 看到一个健康的 PID 永远不重启它，
+    要么靠一根看门狗线程去 os._exit——而那根线程能不能被调度，取决于卡死的 C 调用有没有
+    释放 GIL。**这个前提不该由我们来赌。**
+
+    父进程从头到尾不 import mlx、不碰 Metal，所以它一定还应答得动：它给这次请求卡一个
+    死线，到点就回一句 ERROR 让客户端立刻退回一次性 CLI（用户照样拿到字），然后自己退出，
+    由 launchd 换一个全新的 worker——进程死亡是唯一能真正丢掉一个坏掉的 Metal 上下文的
+    办法。
+
+    MLX 的 import 必须写在函数体里：spawn 会把这个文件重新 import 一遍，写在模块顶层就
+    等于父进程也要付一次加载。
+    """
+    try:
+        import mlx.core as mx
+        import mlx_qwen3_asr as q
+        from mlx_qwen3_asr.tokenizer import _TokenizerHolder
+
+        target = model_target()
+        # 必须在任何一次 transcribe 之前——包括下面的 warm_up，它也走 transcribe。
+        tokenizer_pinned = pin_tokenizer_dir(target)
+        model, _ = q.load_model(target)
+        # Keep the weights in physical RAM; without this macOS can page them out
+        # during idle stretches and the next utterance pays to fault them back in.
+        try:
+            mx.set_wired_limit(
+                mx.device_info()["max_recommended_working_set_size"])
+        except Exception:
+            pass
+        warm_up(model, q)
+        tokenizer = _TokenizerHolder.get(target)
+        cached_context = None
+        prefix_cache = None
+
+        def transcribe(wav, context):
+            nonlocal cached_context, prefix_cache
+            if not context:
+                return q.transcribe(wav, model=model, context=context,
+                                    language="Chinese")
+            if context != cached_context:
+                prefix_cache = FixedPrefixPrefill(model, tokenizer, context)
+                cached_context = context
+                print("prefix-cache tokens=%d cached=%s" % (
+                    prefix_cache.prefix_tokens, prefix_cache.cached is not None,
+                ), flush=True)
+            with prefix_cache.enabled():
+                return q.transcribe(wav, model=model, context=context,
+                                    language="Chinese")
+
+        # 报回**加载它的那个东西**，不是 MODEL：父进程据此告诉外界跑的是哪个 revision，
+        # 以及词表到底钉住了没有（deploy 拿 PONG 里的 tok= 当上线闸门）。
+        pipe.send(("READY", {"model": target, "tokenizer_pinned": tokenizer_pinned}))
+    except Exception as exc:
+        try:
+            pipe.send(("START_ERROR", f"{type(exc).__name__}: {exc}"))
+        except Exception:
+            pass
+        return
+
+    while True:
+        try:
+            message = pipe.recv()
+        except (EOFError, OSError):
+            return
+        if not message or message[0] == "STOP":
+            return
+        _, wav, context = message
+        try:
+            result = transcribe(wav, context)
+            reply = " ".join(str(result.text).splitlines()).strip()
+            # 术语偏置偶尔会把输出整个压没：一整行术语表是很强的先验，撞上短句就可能
+            # 什么都不出。空结果对用户等于"这句话白说了"，所以退一步不带 context 再问
+            # 一次——只在本来就要交白卷的那条路上多花一次，值得。
+            if not reply and context:
+                print("空转写，去掉术语偏置重试一次", flush=True)
+                result = transcribe(wav, "")
+                reply = " ".join(str(result.text).splitlines()).strip()
+            pipe.send(("RESULT", reply))
+        except Exception as exc:
+            pipe.send(("ERROR", f"{type(exc).__name__}: {exc}"))
+
+
+class WorkerTimeout(RuntimeError):
+    """worker 到点没回话：当成假死处理，父进程随后退出。"""
+
+
+class WorkerUnavailable(RuntimeError):
+    """worker 不在了/起不来：同样要换一个新的。"""
+
+
+class ASRWorker:
+    def __init__(self):
+        self.pipe = None
+        self.proc = None
+        self.deadline = None
+
+    def start(self):
+        ctx = multiprocessing.get_context("spawn")
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(target=worker_main, args=(child,),
+                           name="zh-voice-asr-worker", daemon=True)
+        proc.start()
+        child.close()               # 父进程留着写端会让 recv 永远等不到 EOF
+        self.pipe, self.proc = parent, proc
+        if not parent.poll(WORKER_START_TIMEOUT_SEC):
+            self.stop()
+            raise WorkerUnavailable(
+                f"模型 worker 在 {WORKER_START_TIMEOUT_SEC:g}s 内没能就绪")
+        try:
+            kind, payload = parent.recv()
+        except (EOFError, OSError) as exc:
+            self.stop()
+            raise WorkerUnavailable(f"模型 worker 启动过程中退出了：{exc}")
+        if kind != "READY":
+            self.stop()
+            raise WorkerUnavailable(payload)
+        return payload
+
+    def alive(self):
+        return bool(self.proc and self.proc.is_alive())
+
+    def transcribe(self, wav, context):
+        if not self.alive():
+            raise WorkerUnavailable("模型 worker 不在跑")
+        budget = hang_budget(wav)
+        self.deadline = time.monotonic() + budget
+        try:
+            self.pipe.send(("TRANSCRIBE", wav, context))
+        except (BrokenPipeError, EOFError, OSError) as exc:
+            raise WorkerUnavailable(f"请求送不进模型 worker：{exc}")
+        if not self.pipe.poll(budget):
+            raise WorkerTimeout(f"转写卡死：{wav} 超过 {budget:.0f}s 预算未返回")
+        try:
+            kind, payload = self.pipe.recv()
+        except (EOFError, OSError) as exc:
+            raise WorkerUnavailable(f"模型 worker 中途退出：{exc}")
+        if kind == "RESULT":
+            self.deadline = None
+            return payload
+        # worker 自己抓到的转写异常（读不到 wav 之类）：只赔这一次请求，不换 worker。
+        self.deadline = None
+        raise RuntimeError(payload)
+
+    def stop(self):
+        pipe, self.pipe = self.pipe, None
+        proc, self.proc = self.proc, None
+        if pipe is not None:
+            try:
+                pipe.send(("STOP",))
+            except Exception:
+                pass
+            try:
+                pipe.close()
+            except Exception:
+                pass
+        if proc is not None and proc.is_alive():
+            # 卡死的 worker 既不理 STOP 也不理 SIGTERM，所以一定要有 SIGKILL 这一步：
+            # 它才是真正把那个坏掉的 Metal 上下文丢掉的动作。
+            proc.terminate()
+            proc.join(timeout=3)
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=3)
+
+
+def handle(conn, worker, health_only=False):
+    """Serve one request. Nothing in here may propagate: this runs on the accept
+    loop's own thread, so an escaping exception takes the resident server down.
+
+    返回 True = 这个 daemon 已经不可信了，调用方应当退出让 launchd 换新。"""
+    restart = False
+    try:
+        try:
+            conn.settimeout(READ_TIMEOUT_SEC)
+            buf = b""
+            while buf.count(b"\n") < 2:
+                chunk = conn.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_REQUEST_BYTES:
+                    raise ValueError("请求超过 64 KiB")
+            lines = buf.decode("utf-8").split("\n")
+            wav = lines[0].strip()
+            context = (lines[1] if len(lines) > 1 else "").strip()
+            if wav == "PING":
+                # 健康探针。故意不碰模型：要测的是"accept 循环还转不转 + worker 还在不在"。
+                # 卡死时父进程仍然答得动，但它会在超时那一刻就退出，所以外面看到的是连不上
+                # 而不是假的健康。回复带上模型名，好让 deploy 顺手确认装的是哪一个。
+                if not worker.alive():
+                    raise WorkerUnavailable("模型 worker 不在跑")
+                deadline = worker.deadline
+                if deadline is not None and time.monotonic() > deadline:
+                    raise WorkerTimeout("worker deadline exceeded")
+                reply = (f"PONG {MODEL} rev={revision_label()}"
+                         f" tok={'pinned' if _tokenizer_pinned else 'upstream'}"
+                         f" state={'busy' if deadline is not None else 'idle'}")
+            elif health_only:
+                raise ValueError("health socket accepts PING only")
+            elif not wav:
+                raise ValueError("请求里没有 wav 路径")
+            else:
+                started = time.monotonic()
+                reply = worker.transcribe(wav, context)
+                # 自报耗时（只在转写回复上加，PING/ERROR 保持原样）：客户端原来用两次
+                # perl 取时间，量到的还掺着 nc 和 socket。转写本身保证单行，所以加一行
+                # 头信息之后"最后一行仍是转写"这个契约不变。
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                reply = "META asr_ms=%d\n%s" % (elapsed_ms, reply)
+        except (WorkerTimeout, WorkerUnavailable) as exc:
+            # 先把 ERROR 回给客户端再退出：zh-voice 见到 ERROR 会立刻退回一次性 CLI，
+            # 用户这句话还是能出字。直接死掉的话它得白等满 nc 的 90s 超时。
+            reply = f"ERROR: daemon 不健康：{exc}；正在重启"
+            restart = True
+            print(reply, flush=True)
+        except Exception as exc:           # one bad request must not kill the server
+            reply = f"ERROR: {type(exc).__name__}: {exc}"
+        # 回写也要罩在 try 里：客户端读之前就挂断（Ctrl-C、超时）会让 sendall 抛
+        # BrokenPipeError，那是一路冒到 main() 把常驻模型带走的
+        conn.sendall((reply + "\n").encode("utf-8"))
+    except Exception:
+        pass
+    finally:
+        try:
+            conn.close()
+        except OSError:
+            pass
+    return restart
+
+
+def cleanup():
+    """A stale socket file makes the client think the daemon is alive and cost it
+    a failed connect before falling back."""
+    global _worker, _server, _health_server
+    # 先取出再置空：cleanup 会被 atexit 和 idle 看门狗各调一次，必须可重入。
+    worker, _worker = _worker, None
+    if worker is not None:
+        worker.stop()
+    server, _server = _server, None
+    if server is not None:
+        try:
+            server.close()
+        except OSError:
+            pass
+    try:
+        os.unlink(SOCK_PATH)
+    except OSError:
+        pass
+    health_server, _health_server = _health_server, None
+    if health_server is not None:
+        health_server.close()
+    try:
+        os.unlink(SOCK_PATH + ".health")
+    except OSError:
+        pass
+
+
+def main():
+    cache_dir = os.path.dirname(SOCK_PATH)
+    # 700/600：socket 和锁只该当前用户碰得到。以前 socket 落地是 srwxr-xr-x，同机任何
+    # 账号都能往里发请求、读回转写内容——单用户 Mac 上是小事，但收紧不花钱。
+    os.makedirs(cache_dir, mode=0o700, exist_ok=True)
+    os.chmod(cache_dir, 0o700)
+
+    # Single-instance lock, taken BEFORE touching the socket file. Two spawners
+    # exist (launchd KeepAlive and Hammerspoon's health-guarded warmDaemon) and
+    # check-then-spawn is a TOCTOU race: the loser used to unlink the winner's
+    # live socket in cleanup() below, leaving a 3.4 GB zombie serving nothing.
+    # With the lock the loser exits here without having touched anything.
+    global _lock_fd                     # keep the fd alive; close would drop the lock
+    _lock_fd = open(SOCK_PATH + ".lock", "w")
+    os.chmod(SOCK_PATH + ".lock", 0o600)
+    try:
+        fcntl.lockf(_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("another instance holds the lock; exiting", flush=True)
+        return 0
+
+    cleanup()
+    atexit.register(cleanup)
+    # 必须忽略 SIGHUP：给它装处理器会抵消 nohup，拉起它的那个 shell 一退出 daemon 就跟着死
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        signal.signal(sig, lambda *_: sys.exit(0))
+    try:
+        os.setsid()          # 脱离父会话，终端关闭/任务结束都不再波及
+    except OSError:
+        pass
+
+    # 钉死的路径填了却用不上，是**静默**的版本漂移：照样出字，只是出的是另一份权重的字。
+    # 说出来，别让它只能靠 PONG 的 rev= 被事后发现。
+    if MODEL_PATH and model_target() != MODEL_PATH:
+        print(f"⚠️  ZH_VOICE_MODEL_PATH={MODEL_PATH} 里没有 config.json，"
+              f"退回 repo id {MODEL}（版本由 refs/main 决定，没有钉住）", flush=True)
+
+    global _worker, _loaded_from, _tokenizer_pinned
+    _worker = ASRWorker()
+    try:
+        ready = _worker.start()
+    except WorkerUnavailable as exc:
+        print(f"模型 worker 起不来：{exc}", flush=True)
+        return 70
+    _loaded_from = ready["model"]
+    _tokenizer_pinned = bool(ready["tokenizer_pinned"])
+    if not _tokenizer_pinned:
+        # 不是致命的：这条路一直是这么跑的，而且 deploy 在钉不住时会退回去要求那个上游
+        # 仓库存在、且词表和我们钉的逐字节一致。但要说出来，别让它无声无息。
+        print("⚠️  词表没能钉到 snapshot，仍然来自上游 DEFAULT_MODEL_ID 那个仓库", flush=True)
+
+    # socket 在 worker READY 之后才 bind：所以"socket 出现"这件事本身就等价于"权重已经
+    # 进了内存"，deploy 和客户端都可以依赖这个顺序。
+    old_umask = os.umask(0o077)
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        srv.bind(SOCK_PATH)
+    finally:
+        os.umask(old_umask)
+    os.chmod(SOCK_PATH, 0o600)
+    srv.listen(4)
+    global _server
+    _server = srv
+    # This listener never accesses the model pipe. Inference stays serialized
+    # on the data listener; health reports busy until the worker's deadline.
+    global _health_server
+    _health_server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    _health_server.bind(SOCK_PATH + ".health")
+    os.chmod(SOCK_PATH + ".health", 0o600)
+    _health_server.listen(4)
+
+    def health_loop():
+        listener = _health_server
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            handle(conn, _worker, health_only=True)
+
+    threading.Thread(target=health_loop, daemon=True).start()
+    print(f"ready: {_loaded_from} tokenizer_pinned={_tokenizer_pinned}", flush=True)
+
+    # ZH_VOICE_IDLE <= 0 = 常驻模式：launchd 托管时就是这么用的。让模型一直待在内存里，
+    # 代价是 ~3.4 GB 常驻，换掉的是"按下热键那一刻才冷启动"——2026-07-27 那次就是
+    # 唤醒后 34 秒按键，录音和 3.4 GB 冷加载撞在同一秒，把 Hammerspoon 整个拖死。
+    if IDLE_SEC > 0:
+        threading.Thread(target=watchdog, daemon=True).start()
+    else:
+        print("resident: idle timeout disabled", flush=True)
+
+    global last_used
+    while True:
+        conn, _ = srv.accept()
+        last_used = time.time()
+        restart = handle(conn, _worker)
+        last_used = time.time()
+        if restart:
+            print("退出 70，让 launchd 换一个干净的 daemon", flush=True)
+            return 70
+
+
+if __name__ == "__main__":
+    sys.exit(main())

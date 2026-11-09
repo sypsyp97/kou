@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Stub `opencc -c t2s`: traditional -> simplified over a small fixed table.
+
+Only needs to cover the characters the suite feeds it; anything else passes
+through untouched.
+"""
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+_log = os.environ.get("STUB_LOG_DIR")
+if _log:
+    with open(os.path.join(_log, "opencc.log"), "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+T2S = {
+    "測": "测", "試": "试", "轉": "转", "寫": "写", "結": "结", "語": "语",
+    "輸": "输", "這": "这", "個": "个", "說": "说", "話": "话", "沒": "没",
+    "聽": "听", "錯": "错", "誤": "误", "開": "开", "關": "关", "對": "对",
+    "應": "应", "準": "准", "備": "备", "實": "实", "現": "现", "網": "网",
+    "絡": "络", "學": "学", "習": "习", "數": "数", "據": "据", "機": "机",
+    "訓": "训", "練": "练", "動": "动", "態": "态", "島": "岛", "點": "点",
+    "聲": "声", "麥": "麦", "風": "风", "後": "后", "來": "来", "們": "们",
+}
+
+data = sys.stdin.buffer.read().decode("utf-8", "replace")
+sys.stdout.write("".join(T2S.get(ch, ch) for ch in data))

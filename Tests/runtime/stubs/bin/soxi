@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Stub `soxi`: answers -r / -c / -D straight out of the wav header.
+
+Pure stdlib so the suite never needs sox installed, and every invocation is
+recorded so tests can assert on probing behaviour.
+"""
+import json
+import os
+import sys
+import wave
+
+argv = sys.argv[1:]
+_log = os.environ.get("STUB_LOG_DIR")
+if _log:
+    with open(os.path.join(_log, "soxi.log"), "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+if len(argv) < 2:
+    sys.stderr.write("soxi: usage: soxi -r|-c|-D FILE\n")
+    sys.exit(2)
+
+flag, path = argv[0], argv[-1]
+try:
+    with wave.open(path, "rb") as w:
+        channels = w.getnchannels()
+        rate = w.getframerate()
+        frames = w.getnframes()
+except Exception:
+    sys.stderr.write("soxi FAIL formats: can't open input file `%s'\n" % path)
+    sys.exit(2)
+
+if flag == "-r":
+    print(rate)
+elif flag == "-c":
+    print(channels)
+elif flag == "-D":
+    print("%.6f" % (frames / float(rate) if rate else 0.0))
+else:
+    sys.stderr.write("soxi: unsupported flag %s\n" % flag)
+    sys.exit(2)

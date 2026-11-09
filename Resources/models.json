@@ -1,0 +1,5 @@
+{
+  "large": {"repo": "mlx-community/Qwen3-ASR-1.7B-8bit", "revision": "a8379a2e2f9e313c9292cdf1af4055ab56d50d55"},
+  "small": {"repo": "mlx-community/Qwen3-ASR-0.6B-8bit", "revision": "89e96d92ba34aca20b3e29fb10cc284097d1219f"},
+  "vad": {"repo": "aufklarer/Silero-VAD-v6.2.1-CoreML", "revision": "523876545a57961474fee9df913e833e130560b8"}
+}

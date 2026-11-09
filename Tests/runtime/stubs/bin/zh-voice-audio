@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Recording stub for the local audio/VAD executable (`zh-voice-audio`).
+
+A leading `analyze` subcommand is accepted and ignored — the real binary
+takes it, and the tests assert on the flags that follow.
+
+STUB_VAD_RESULT=speech (default), silence, or error controls the exit status.
+With --json it also prints a payload shaped like the real detector's, so the
+caller's metric extraction runs for real instead of always falling back to "?".
+"""
+import json
+import os
+import sys
+
+
+argv = sys.argv[1:]
+if argv and argv[0] == "analyze":
+    argv = argv[1:]
+log = os.environ.get("STUB_LOG_DIR")
+if log:
+    with open(os.path.join(log, "zh-voice-audio.log"), "a") as stream:
+        stream.write(json.dumps(argv) + "\n")
+
+result = os.environ.get("STUB_VAD_RESULT", "speech")
+if result == "error":
+    print("stub detector failed", file=sys.stderr)
+    raise SystemExit(2)
+
+speech = result != "silence"
+if "--json" in argv:
+    print(json.dumps({
+        "speech": speech,
+        "max_probability": 0.97 if speech else 0.013,
+        "speech_duration_ms": 820 if speech else 0,
+        "threshold": 0.5,
+        "used_strong_rule": False,
+        "input_duration_ms": 1500,
+        "output_duration_ms": 980 if speech else 1500,
+        "trim_start_ms": 300 if speech else 0,
+        "trim_end_ms": 1280 if speech else 1500,
+        "trimmed": speech,
+        "segments": [{"start_ms": 460, "end_ms": 1120}] if speech else [],
+    }, sort_keys=True, separators=(",", ":")))   # 紧凑，和 Swift JSONEncoder 同形
+
+raise SystemExit(0 if speech else 3)

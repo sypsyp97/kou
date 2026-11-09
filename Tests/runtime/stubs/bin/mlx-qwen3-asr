@@ -1,0 +1,20 @@
+#!/usr/bin/env python3
+"""Stub one-shot ASR CLI.
+
+Records argv (so tests can assert on --context / on "was the fallback used at
+all") and prints whatever STUB_ASR_STDOUT says, with \\n escapes honoured.
+"""
+import json
+import os
+import sys
+
+argv = sys.argv[1:]
+_log = os.environ.get("STUB_LOG_DIR")
+if _log:
+    with open(os.path.join(_log, "mlx-qwen3-asr.log"), "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+out = os.environ.get("STUB_ASR_STDOUT", "命令行兜底结果")
+sys.stdout.write(out.replace("\\n", "\n"))
+if out and not out.endswith("\\n"):
+    sys.stdout.write("\n")

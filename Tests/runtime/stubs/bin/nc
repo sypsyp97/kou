@@ -1,0 +1,56 @@
+#!/usr/bin/env python3
+"""Stub `nc -U SOCKET`: a faithful unix-socket netcat, in pure stdlib.
+
+Faithful on purpose - it really connects, so a dead socket really fails (exit
+1, empty stdout) and a live fake daemon really answers. The invocation is
+recorded so tests can tell whether the socket path was tried at all.
+"""
+import json
+import os
+import socket
+import sys
+
+argv = sys.argv[1:]
+_log = os.environ.get("STUB_LOG_DIR")
+if _log:
+    with open(os.path.join(_log, "nc.log"), "a") as fh:
+        fh.write(json.dumps(argv) + "\n")
+
+path = None
+if "-U" in argv:
+    path = argv[argv.index("-U") + 1]
+elif argv:
+    path = argv[-1]
+if not path:
+    sys.stderr.write("nc: no socket path\n")
+    sys.exit(2)
+
+payload = sys.stdin.buffer.read()
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+try:
+    s.connect(path)
+except OSError as exc:
+    sys.stderr.write("nc: connect to %s failed: %s\n" % (path, exc))
+    sys.exit(1)
+
+try:
+    s.sendall(payload)
+    try:
+        s.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+    out = b""
+    while True:
+        try:
+            chunk = s.recv(65536)
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        out += chunk
+finally:
+    s.close()
+
+sys.stdout.buffer.write(out)

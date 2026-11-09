@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+"""Stub daemon binary: the real one loads a 3.4 GB model, this one only leaves
+a marker file behind so tests can prove the client relaunched it.
+
+The marker records `logPath` - where the launcher pointed our stdout, read back
+off fd 1 with F_GETPATH. That is the only way to see, from outside, whether the
+relaunch log landed under $TMPDIR or in the shared real /tmp.
+"""
+import fcntl
+import json
+import os
+import sys
+import time
+
+F_GETPATH = 50          # <sys/fcntl.h>, macOS
+
+
+def fd_path(fd):
+    try:
+        raw = fcntl.fcntl(fd, F_GETPATH, bytes(1024))
+    except (OSError, ValueError):
+        return None
+    return raw.split(b"\x00", 1)[0].decode("utf-8", "replace") or None
+
+
+_log = os.environ.get("STUB_LOG_DIR")
+if _log:
+    with open(os.path.join(_log, "daemon-launched.log"), "a") as fh:
+        fh.write(json.dumps({"argv": sys.argv[1:], "t": time.time(),
+                             "logPath": fd_path(1)}) + "\n")

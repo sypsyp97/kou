@@ -1,0 +1,7 @@
+dist/
+.build/
+.swiftpm/
+__pycache__/
+.pytest_cache/
+*.xcuserstate
+.DS_Store
