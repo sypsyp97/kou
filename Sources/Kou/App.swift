@@ -309,7 +309,7 @@ struct VocabularyPane: View {
                 TextEditor(text: $model.termsText)
                     .font(.system(.body, design: .monospaced))
                     .scrollContentBackground(.hidden)
-                    .frame(height: 220)
+                    .frame(height: 300)
                 Text(L("每行一个词，词里可以有空格（如 Visual Studio Code）。# 之后的内容会被忽略。", "Enter one term per line. A term can contain spaces, such as Visual Studio Code. Kou ignores text after #."))
                     .font(.callout).foregroundStyle(.secondary)
             } header: {
@@ -331,8 +331,114 @@ struct VocabularyPane: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 520, height: 480)
+        .frame(width: 520, height: 560)
         .disabled(model.terminating)
+    }
+}
+
+// MARK: - Settings window
+
+enum SettingsPane: Int, CaseIterable, Identifiable {
+    case general, vocabulary
+    var id: Int { rawValue }
+    var title: String { self == .general ? L("通用", "General") : L("词汇", "Vocabulary") }
+    var symbol: String { self == .general ? "gearshape" : "character.book.closed" }
+}
+
+/// One capsule per pane. The selected capsule is Liquid Glass and slides to the new pane.
+struct PaneSwitcher: View {
+    let selection: SettingsPane
+    let select: (SettingsPane) -> Void
+    @Namespace private var thumb
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(SettingsPane.allCases) { pane in
+                let selected = pane == selection
+                Button { select(pane) } label: {
+                    Label(pane.title, systemImage: pane.symbol)
+                        .font(.system(size: 13, weight: selected ? .semibold : .regular))
+                        .foregroundStyle(selected ? Color.accentColor : Color.secondary)
+                        .padding(.horizontal, 16)
+                        .frame(minWidth: 112, minHeight: 30)
+                        .contentShape(Capsule())
+                        .background {
+                            if selected { Thumb().matchedGeometryEffect(id: "thumb", in: thumb) }
+                        }
+                }
+                .buttonStyle(.plain)
+                .accessibilityAddTraits(selected ? .isSelected : [])
+            }
+        }
+        .padding(3)
+        .background(.quaternary.opacity(0.6), in: Capsule())
+    }
+
+    private struct Thumb: View {
+        var body: some View {
+            if #available(macOS 26, *) {
+                Capsule().fill(.clear).glassEffect(.regular.interactive(), in: Capsule())
+            } else {
+                Capsule().fill(.background).shadow(color: .black.opacity(0.12), radius: 2, y: 1)
+            }
+        }
+    }
+}
+
+/// The selected settings pane. `forward` changes one update before `pane`, because
+/// the outgoing pane keeps the transition from its last update.
+@MainActor final class SettingsState: ObservableObject {
+    @Published private(set) var pane: SettingsPane
+    @Published private(set) var forward = true
+
+    init() { pane = SettingsPane(rawValue: UserDefaults.standard.integer(forKey: "settingsPane")) ?? .general }
+
+    func select(_ next: SettingsPane) {
+        guard next != pane else { return }
+        forward = next.rawValue > pane.rawValue
+        UserDefaults.standard.set(next.rawValue, forKey: "settingsPane")
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.4, dampingFraction: 0.82)) { self.pane = next }
+        }
+    }
+}
+
+/// Settings: the pane switcher on top, and the selected pane below. A pane slides in
+/// from the side of its capsule while the old pane slides out and blurs.
+struct SettingsView: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var state: SettingsState
+
+    var body: some View {
+        VStack(spacing: 0) {
+            PaneSwitcher(selection: state.pane, select: state.select)
+            // Below the title bar, which would take clicks as window drags.
+            .padding(.top, 30)
+            .padding(.bottom, 2)
+            ZStack {
+                switch state.pane {
+                case .general: GeneralPane(model: model).transition(slide)
+                case .vocabulary: VocabularyPane(model: model).transition(slide)
+                }
+            }
+            .frame(width: 520, height: 560)
+            .clipped()
+        }
+    }
+
+    private var slide: AnyTransition {
+        let shift: CGFloat = state.forward ? 36 : -36
+        return .asymmetric(
+            insertion: .modifier(active: PaneShift(x: shift, amount: 1), identity: PaneShift(x: 0, amount: 0)),
+            removal: .modifier(active: PaneShift(x: -shift, amount: 1), identity: PaneShift(x: 0, amount: 0)))
+    }
+}
+
+private struct PaneShift: ViewModifier {
+    let x: CGFloat
+    let amount: CGFloat
+    func body(content: Content) -> some View {
+        content.offset(x: x).opacity(1 - amount).blur(radius: 4 * amount)
     }
 }
 
@@ -426,7 +532,6 @@ struct OnboardingView: View {
     private var statusItem: NSStatusItem?
     private var observations: [NSObjectProtocol] = []
     private var cancellables: Set<AnyCancellable> = []
-    private var tabSelection: AnyCancellable?
     private var terminationPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -521,28 +626,12 @@ struct OnboardingView: View {
     @objc func openSettings() {
         guard let model, !model.terminating else { return }
         if settingsWindow == nil {
-            let tabs = NSTabViewController()
-            tabs.tabStyle = .toolbar
-            let panes: [(String, String, AnyView)] = [
-                (L("通用", "General"), "gearshape", AnyView(GeneralPane(model: model))),
-                (L("词汇", "Vocabulary"), "character.book.closed", AnyView(VocabularyPane(model: model))),
-            ]
-            for (title, symbol, view) in panes {
-                let controller = NSHostingController(rootView: view)
-                controller.sizingOptions = .preferredContentSize
-                controller.title = title
-                let item = NSTabViewItem(viewController: controller)
-                item.label = title
-                item.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
-                tabs.addTabViewItem(item)
-            }
-            tabs.selectedTabViewItemIndex = min(UserDefaults.standard.integer(forKey: "settingsPane"), tabs.tabViewItems.count - 1)
-            tabSelection = tabs.tabView.publisher(for: \.selectedTabViewItem).sink { [weak tabs] _ in
-                if let tabs { UserDefaults.standard.set(tabs.selectedTabViewItemIndex, forKey: "settingsPane") }
-            }
-            let window = NSWindow(contentViewController: tabs)
-            window.styleMask = [.titled, .closable]
-            window.toolbarStyle = .preference
+            let view = SettingsView(model: model, state: SettingsState())
+            let window = NSWindow(contentViewController: NSHostingController(rootView: view))
+            window.styleMask = [.titled, .closable, .fullSizeContentView]
+            window.titlebarAppearsTransparent = true
+            window.titleVisibility = .hidden
+            window.title = L("Kou 设置", "Kou Settings")
             window.isReleasedWhenClosed = false
             window.delegate = self
             window.center()
@@ -556,7 +645,7 @@ struct OnboardingView: View {
     // keeps observation records for every layout they cause. Release closed windows.
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
-        if window === settingsWindow { settingsWindow = nil; tabSelection = nil }
+        if window === settingsWindow { settingsWindow = nil }
         if window === onboardingWindow { onboardingWindow = nil }
     }
 

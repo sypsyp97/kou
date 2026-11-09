@@ -22,8 +22,8 @@ fi
 
 bash build.sh
 URL="https://github.com/$REPO/releases/download/$TAG/Kou-$VERSION-arm64.zip"
-python3 package.py --app dist/Kou.app --url "$URL"
-ARCHIVE="dist/Kou-$VERSION-arm64.zip"
+python3 package.py --app dist.noindex/Kou.app --url "$URL"
+ARCHIVE="dist.noindex/Kou-$VERSION-arm64.zip"
 
 git tag -a "$TAG" -m "Kou $VERSION"
 git push -q origin "$TAG"
@@ -33,7 +33,7 @@ TAP="$(mktemp -d)"
 trap 'rm -rf "$TAP"' EXIT
 gh repo clone "$TAP_REPO" "$TAP" -- -q
 mkdir -p "$TAP/Casks"
-cp dist/kou.rb "$TAP/Casks/kou.rb"
+cp dist.noindex/kou.rb "$TAP/Casks/kou.rb"
 git -C "$TAP" add Casks/kou.rb
 git -C "$TAP" -c user.name="$(git config user.name)" -c user.email="$(git config user.email)" commit -q -m "kou $VERSION"
 git -C "$TAP" push -q

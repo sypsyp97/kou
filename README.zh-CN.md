@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/media/island-dark.gif">
-    <img src="docs/media/island-light.gif" width="520" alt="Kou 浮层：录音、转写、已粘贴">
+    <img src="docs/media/island-light.gif" width="640" alt="Kou 浮层：录音、转写、已粘贴">
   </picture>
 </p>
 <h1 align="center">Kou</h1>
@@ -113,7 +113,7 @@ defaults delete io.github.sypsyp97.Kou
    git clone https://github.com/sypsyp97/kou.git && cd kou
    KOU_SIGN_IDENTITY="<证书名称>" bash build.sh
    ```
-3. 把 `dist/Kou.app` 移到 `/Applications`。
+3. 把 `dist.noindex/Kou.app` 移到 `/Applications`。
 
 ## 开发
 

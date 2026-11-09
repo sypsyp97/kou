@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/media/island-dark.gif">
-    <img src="docs/media/island-light.gif" width="520" alt="Kou overlay: recording, transcribing, pasted">
+    <img src="docs/media/island-light.gif" width="640" alt="Kou overlay: recording, transcribing, pasted">
   </picture>
 </p>
 <h1 align="center">Kou</h1>
@@ -113,7 +113,7 @@ You need the Xcode Command Line Tools and one code-signing certificate. macOS li
    git clone https://github.com/sypsyp97/kou.git && cd kou
    KOU_SIGN_IDENTITY="<certificate name>" bash build.sh
    ```
-3. Move `dist/Kou.app` to `/Applications`.
+3. Move `dist.noindex/Kou.app` to `/Applications`.
 
 ## Development
 

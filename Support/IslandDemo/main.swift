@@ -22,16 +22,54 @@ final class FrameSink: NSObject, SCStreamOutput {
     }
 }
 
+/// The top of a MacBook screen: bezel, rounded display corners, wallpaper, and menu bar.
+/// The overlay hangs from the bezel, as on a real Mac.
+struct MacTop: View {
+    @ObservedObject var model: IslandModel
+    let dark: Bool
+    static let bezel: CGFloat = 14
+    static let width: CGFloat = 720
+    static func height(_ model: IslandModel) -> CGFloat { bezel + model.notchHeight + 54 + 18 }
+
+    var body: some View {
+        let ink = dark ? Color.white : Color.black
+        ZStack(alignment: .top) {
+            Color.black
+            ZStack(alignment: .top) {
+                LinearGradient(colors: dark
+                    ? [Color(red: 0.12, green: 0.13, blue: 0.19), Color(red: 0.21, green: 0.16, blue: 0.25)]
+                    : [Color(red: 0.84, green: 0.88, blue: 0.95), Color(red: 0.96, green: 0.92, blue: 0.94)],
+                    startPoint: .topLeading, endPoint: .bottomTrailing)
+                HStack(spacing: 16) {
+                    Spacer()
+                    RoundedRectangle(cornerRadius: 3.5, style: .continuous).stroke(ink, lineWidth: 1.5).frame(width: 13, height: 13)
+                    Image(systemName: "wifi")
+                    Image(systemName: "battery.75percent")
+                    Text("Mon 9:41")
+                }
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(ink.opacity(0.85))
+                .padding(.horizontal, 18)
+                .frame(height: model.notchHeight)
+                .background(dark ? Color.black.opacity(0.18) : Color.white.opacity(0.32))
+            }
+            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 12, topTrailingRadius: 12, style: .continuous))
+            .padding([.top, .horizontal], Self.bezel)
+            IslandView(model: model).padding(.top, Self.bezel)
+        }
+        .frame(width: Self.width, height: Self.height(model))
+    }
+}
+
 @MainActor func record(to folder: URL, dark: Bool) async throws {
     let model = IslandModel()
     model.notchWidth = 179
     model.notchHeight = 32
-    let height = model.notchHeight + 54
-    let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: 344, height: height),
+    let height = MacTop.height(model)
+    let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: MacTop.width, height: height),
                           styleMask: .borderless, backing: .buffered, defer: false)
-    window.backgroundColor = dark ? NSColor(red: 0.11, green: 0.11, blue: 0.12, alpha: 1)
-                                  : NSColor(red: 0.96, green: 0.96, blue: 0.97, alpha: 1)
-    window.contentView = NSHostingView(rootView: IslandView(model: model))
+    window.backgroundColor = .black
+    window.contentView = NSHostingView(rootView: MacTop(model: model, dark: dark))
     window.orderFrontRegardless()
     try await Task.sleep(nanoseconds: 300_000_000)
 
@@ -40,7 +78,7 @@ final class FrameSink: NSObject, SCStreamOutput {
         throw NSError(domain: "IslandDemo", code: 1, userInfo: [NSLocalizedDescriptionKey: "Window not found. Allow Screen Recording for this terminal."])
     }
     let configuration = SCStreamConfiguration()
-    configuration.width = 688
+    configuration.width = Int(MacTop.width * 2)
     configuration.height = Int(height * 2)
     configuration.minimumFrameInterval = CMTime(value: 1, timescale: 60)
     configuration.showsCursor = false

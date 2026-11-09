@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
-OUT="${KOU_BUILD_DIR:-$ROOT/dist}"
+OUT="${KOU_BUILD_DIR:-$ROOT/dist.noindex}"
 APP="$OUT/Kou.app"
 IDENTITY="${KOU_SIGN_IDENTITY:-}"
 IDENTITY_FILE="$HOME/Library/Application Support/Kou/build-signing-identity"

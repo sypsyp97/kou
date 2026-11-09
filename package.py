@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--app", type=Path, default=Path(__file__).parent / "dist/Kou.app")
+    parser.add_argument("--app", type=Path, default=Path(__file__).parent / "dist.noindex/Kou.app")
     parser.add_argument("--url", required=True, help="Final download URL for this archive")
     args = parser.parse_args()
     app = args.app.resolve()

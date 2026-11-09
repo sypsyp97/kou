@@ -1,4 +1,4 @@
-dist/
+dist.noindex/
 .build/
 .swiftpm/
 __pycache__/
