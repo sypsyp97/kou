@@ -259,4 +259,4 @@ Signed builds include Apple's [audio-input entitlement](https://developer.apple.
 
 ## License
 
-License: to be decided.
+Kou is released under the [MIT License](LICENSE).

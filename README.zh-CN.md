@@ -259,4 +259,4 @@ python3 package.py --app /path/to/Kou.app --url HTTPS_FINAL_ARCHIVE_URL
 
 ## 许可证
 
-许可证：待定。
+Kou 以 [MIT 许可证](LICENSE) 发布。
