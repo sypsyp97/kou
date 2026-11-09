@@ -4,6 +4,7 @@
     <img src="docs/media/island-light.gif" width="680" alt="Kou 浮层：录音、转写、已粘贴">
   </picture>
 </p>
+<p align="center"><img src="docs/media/icon.png" width="96" alt="Kou 图标"></p>
 <h1 align="center">Kou</h1>
 <p align="center">macOS 本地听写。按一个键，说话，文字出现在光标处。</p>
 <p align="center"><a href="README.md">English</a></p>

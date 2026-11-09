@@ -4,6 +4,7 @@
     <img src="docs/media/island-light.gif" width="680" alt="Kou overlay: recording, transcribing, pasted">
   </picture>
 </p>
+<p align="center"><img src="docs/media/icon.png" width="96" alt="Kou icon"></p>
 <h1 align="center">Kou</h1>
 <p align="center">Local dictation for macOS. Press a key, speak, and the text appears at your cursor.</p>
 <p align="center"><a href="README.zh-CN.md">简体中文</a></p>
