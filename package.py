@@ -26,19 +26,21 @@ def main():
     subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
     subprocess.run(["ditto", "-c", "-k", "--keepParent", str(app), str(archive)], check=True)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    # Homebrew audit expects the version in the URL to come from the version stanza.
+    cask_url = args.url.replace(version, "#{version}")
     cask = f'''cask "kou" do
   version "{version}"
   sha256 "{digest}"
 
-  url "{args.url}"
+  url "{cask_url}"
   name "Kou"
   desc "Local Mandarin dictation with a modifier-key shortcut"
   homepage "https://github.com/sypsyp97/kou"
 
   depends_on arch: :arm64
-  depends_on macos: :sonoma
   depends_on formula: "opencc"
   depends_on formula: "uv"
+  depends_on macos: :sonoma
 
   app "Kou.app"
   binary "#{{appdir}}/Kou.app/Contents/MacOS/Kou", target: "kou"

@@ -1,0 +1,19 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Build
+        run: swift build
+      - name: Swift tests
+        run: swift test
+      - name: Python tests
+        run: uv run --with-requirements Tests/runtime/requirements-dev.txt python -m pytest -q Tests
