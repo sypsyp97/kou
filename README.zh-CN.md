@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/media/island-dark.gif">
-    <img src="docs/media/island-light.gif" width="640" alt="Kou 浮层：录音、转写、已粘贴">
+    <img src="docs/media/island-light.gif" width="680" alt="Kou 浮层：录音、转写、已粘贴">
   </picture>
 </p>
 <h1 align="center">Kou</h1>

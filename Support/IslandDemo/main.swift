@@ -22,40 +22,55 @@ final class FrameSink: NSObject, SCStreamOutput {
     }
 }
 
-/// The top of a MacBook screen: bezel, rounded display corners, wallpaper, and menu bar.
-/// The overlay hangs from the bezel, as on a real Mac.
+/// The top of a MacBook lid: aluminium rim, rounded lid corners, black bezel, display
+/// with rounded top corners, wallpaper, and menu bar. The overlay hangs from the bezel.
+/// Proportions follow the MacBook Pro frame in devices.css (MIT, picturepan2).
 struct MacTop: View {
     @ObservedObject var model: IslandModel
     let dark: Bool
-    static let bezel: CGFloat = 14
-    static let width: CGFloat = 720
-    static func height(_ model: IslandModel) -> CGFloat { bezel + model.notchHeight + 54 + 18 }
+    static let margin: CGFloat = 14
+    static let bezel: CGFloat = 13
+    static let lidWidth: CGFloat = 720
+    static let width: CGFloat = lidWidth + margin * 2
+    static func height(_ model: IslandModel) -> CGFloat { margin + bezel + model.notchHeight + 54 + 34 }
 
     var body: some View {
         let ink = dark ? Color.white : Color.black
+        let page = dark ? Color(red: 0.05, green: 0.07, blue: 0.09) : Color.white
+        let lid = UnevenRoundedRectangle(topLeadingRadius: 26, topTrailingRadius: 26, style: .continuous)
         ZStack(alignment: .top) {
-            Color.black
+            page
             ZStack(alignment: .top) {
-                LinearGradient(colors: dark
-                    ? [Color(red: 0.12, green: 0.13, blue: 0.19), Color(red: 0.21, green: 0.16, blue: 0.25)]
-                    : [Color(red: 0.84, green: 0.88, blue: 0.95), Color(red: 0.96, green: 0.92, blue: 0.94)],
-                    startPoint: .topLeading, endPoint: .bottomTrailing)
-                HStack(spacing: 16) {
-                    Spacer()
-                    RoundedRectangle(cornerRadius: 3.5, style: .continuous).stroke(ink, lineWidth: 1.5).frame(width: 13, height: 13)
-                    Image(systemName: "wifi")
-                    Image(systemName: "battery.75percent")
-                    Text("Mon 9:41")
+                lid.fill(Color(white: 0.05))
+                lid.strokeBorder(dark ? Color(white: 0.30) : Color(red: 0.78, green: 0.79, blue: 0.80), lineWidth: 2)
+                ZStack(alignment: .top) {
+                    LinearGradient(colors: dark
+                        ? [Color(red: 0.12, green: 0.13, blue: 0.19), Color(red: 0.21, green: 0.16, blue: 0.25)]
+                        : [Color(red: 0.84, green: 0.88, blue: 0.95), Color(red: 0.96, green: 0.92, blue: 0.94)],
+                        startPoint: .topLeading, endPoint: .bottomTrailing)
+                    HStack(spacing: 16) {
+                        Spacer()
+                        RoundedRectangle(cornerRadius: 3.5, style: .continuous).stroke(ink, lineWidth: 1.5).frame(width: 13, height: 13)
+                        Image(systemName: "wifi")
+                        Image(systemName: "battery.75percent")
+                        Text("Mon 9:41")
+                    }
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundStyle(ink.opacity(0.85))
+                    .padding(.horizontal, 18)
+                    .frame(height: model.notchHeight)
+                    .background(dark ? Color.black.opacity(0.18) : Color.white.opacity(0.32))
                 }
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(ink.opacity(0.85))
-                .padding(.horizontal, 18)
-                .frame(height: model.notchHeight)
-                .background(dark ? Color.black.opacity(0.18) : Color.white.opacity(0.32))
+                .clipShape(UnevenRoundedRectangle(topLeadingRadius: 14, topTrailingRadius: 14, style: .continuous))
+                .padding([.top, .horizontal], Self.bezel)
+                IslandView(model: model).padding(.top, Self.bezel)
             }
-            .clipShape(UnevenRoundedRectangle(topLeadingRadius: 12, topTrailingRadius: 12, style: .continuous))
-            .padding([.top, .horizontal], Self.bezel)
-            IslandView(model: model).padding(.top, Self.bezel)
+            .frame(width: Self.lidWidth)
+            .padding(.top, Self.margin)
+            // The lid continues below the frame; fade it into the page.
+            LinearGradient(colors: [page.opacity(0), page], startPoint: .top, endPoint: .bottom)
+                .frame(height: 30)
+                .frame(maxHeight: .infinity, alignment: .bottom)
         }
         .frame(width: Self.width, height: Self.height(model))
     }
@@ -68,7 +83,7 @@ struct MacTop: View {
     let height = MacTop.height(model)
     let window = NSWindow(contentRect: NSRect(x: -4000, y: -4000, width: MacTop.width, height: height),
                           styleMask: .borderless, backing: .buffered, defer: false)
-    window.backgroundColor = .black
+    window.backgroundColor = dark ? NSColor(red: 0.05, green: 0.07, blue: 0.09, alpha: 1) : .white
     window.contentView = NSHostingView(rootView: MacTop(model: model, dark: dark))
     window.orderFrontRegardless()
     try await Task.sleep(nanoseconds: 300_000_000)
