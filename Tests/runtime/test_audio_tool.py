@@ -1,7 +1,10 @@
-"""Support/zh-voice-vad.swift 的结构契约（真机上的 AVAudioEngine 行为归 deploy 冒烟管）。
+"""Structural contract of Support/zh-voice-vad.swift. AVAudioEngine behavior on
+real hardware is not covered here.
 
-这里钉的是 arm 模式的安全关键面：退出码、信号次序、"待命不碰磁盘"。它们没有编译期
-保护，一次重构就能悄悄掉，而症状全都是"开头又开始漏字"这种要用耳朵才发现的。
+These tests pin the safety-critical parts of arm mode: exit codes, signal order
+and "armed mode does not touch the disk". The compiler does not protect them.
+A refactor can drop them silently, and the symptom (the start of speech is lost
+again) is audible only.
 """
 import re
 
@@ -11,8 +14,9 @@ SWIFT = SUPPORT / "zh-voice-vad.swift"
 
 
 def test_arm_mode_exit_codes_are_the_documented_contract():
-    """5 = 解除待命（零文件），6 = 设备变化（要重臂）。init.lua 靠这两个数分辨
-    "怎么退的"，漂一个数就是把"正常收掉"当成"意外崩溃"记日志、或反过来。"""
+    """5 = disarmed (no file written), 6 = device changed (arm again). The caller
+    uses these two numbers to tell how the process ended. If a number drifts, a
+    normal disarm is logged as a crash, or the reverse."""
     code = SWIFT.read_text(encoding="utf-8")
 
     assert re.search(r"disarmedExit\s*:\s*Int32\s*=\s*5", code), "解除待命必须是 5"
@@ -22,8 +26,9 @@ def test_arm_mode_exit_codes_are_the_documented_contract():
 
 
 def test_sigusr1_is_ignored_at_program_entry_not_inside_the_arm_branch():
-    """SIGUSR1 默认处置是杀进程。实测它能赶在参数解析之前到——SIG_IGN 写在 arm 分支
-    里等于给"早到的 GO"留了一扇能无声杀掉待命进程的门。必须钉在程序入口。"""
+    """The default disposition of SIGUSR1 kills the process. The signal can arrive
+    before argument parsing. A SIG_IGN inside the arm branch would leave a door
+    where an early GO silently kills the armed process. Pin it at program entry."""
     code = SWIFT.read_text(encoding="utf-8")
 
     ign = code.find("signal(SIGUSR1, SIG_IGN)")
@@ -31,15 +36,16 @@ def test_sigusr1_is_ignored_at_program_entry_not_inside_the_arm_branch():
     run_call = code.find("exit(try run())")
     assert run_call != -1, "找不到程序入口"
     assert ign < run_call, "SIG_IGN 在 run() 之后才装，早到的信号还是能杀进程"
-    # 且不在某个函数体里：入口那份是顶层语句（缩进为 0）
+    # It must not be inside a function body: the entry statement is top level (indent 0).
     line = code[:ign].rsplit("\n", 1)[-1]
     assert line == "", "signal(SIGUSR1, SIG_IGN) 不在顶层（前面有缩进：%r）" % line
 
 
 def test_armed_handshake_prints_armed_before_waiting_for_go():
-    """调用方只在见到 ARMED 后才发 GO——这是早到信号问题的真正保证（SIG_IGN 只是兜
-    意外）。打印必须带 fflush：stdout 接的是管道，不 flush 的话 Lua 永远握不到手，
-    每次按键都退回冷启动，预备等于白做。"""
+    """The caller sends GO only after it sees ARMED. This handshake is the real
+    guarantee against early signals (SIG_IGN only covers the unexpected). The
+    print needs fflush: stdout is a pipe, and without a flush the handshake never
+    completes, every key press falls back to a cold start, and arming is wasted."""
     code = SWIFT.read_text(encoding="utf-8")
 
     m = re.search(r'print\("ARMED"\)\s*\n\s*fflush\(stdout\)', code)
@@ -49,8 +55,9 @@ def test_armed_handshake_prints_armed_before_waiting_for_go():
 
 
 def test_level_file_only_written_while_capturing():
-    """电平计时器必须从 startCapture 才开始：待命阶段一个字节都不该出现在磁盘上，
-    而且条子动了就该意味着真的在采集（这是用户判断"开始说话了没"的信号）。"""
+    """The level timer must start only in startCapture. The armed phase must write
+    no byte to disk. A moving level bar must mean real capture, because the user
+    reads it as the signal that speaking has started."""
     code = SWIFT.read_text(encoding="utf-8")
 
     configure = re.search(r"func configure\(.*?\n    \}", code, re.S)
@@ -64,9 +71,10 @@ def test_level_file_only_written_while_capturing():
 
 
 def test_voice_processing_is_off_unless_asked_for():
-    """Apple 语音处理默认关（2026-08-24）：它的 AGC 在静音房间里把底噪抬 46dB
-    （实测 RMS 0.031-0.061 vs 0.00013），一直在大幅改写增益。开回去只有一条路
-    `--voice-processing`；默认值漂回 true 是静默的，只有耳朵能发现。"""
+    """Apple voice processing is off by default. Its AGC raises the noise floor by
+    46 dB in a silent room (RMS 0.031-0.061 vs 0.00013) and rewrites the gain
+    heavily. The only way to turn it on is `--voice-processing`. A default that
+    drifts back to true is silent and audible only."""
     code = SWIFT.read_text(encoding="utf-8")
 
     m = re.search(r"var voiceProcessing = (true|false)", code)
@@ -77,9 +85,10 @@ def test_voice_processing_is_off_unless_asked_for():
 
 
 def test_other_audio_ducking_is_pinned_to_min_without_advanced():
-    """VP 一开就把其它音频压到 −15dB（scalar 0.178），而且待命不采集时也照压——
-    这是"看视频一直闷着"的根因。.min 是 −4dB（0.631）。⚠️ enableAdvancedDucking
-    设 true 会把 .min 吃掉、退回 −15dB，所以这个 false 和 .min 同等重要。"""
+    """Enabling VP ducks other audio to -15 dB (scalar 0.178), and it ducks even
+    while armed without capture. This is the root cause of muffled video playback.
+    .min is -4 dB (0.631). enableAdvancedDucking = true ignores .min and falls
+    back to -15 dB, so the false value is as important as .min."""
     code = SWIFT.read_text(encoding="utf-8")
 
     m = re.search(
@@ -97,9 +106,10 @@ def test_other_audio_ducking_is_pinned_to_min_without_advanced():
 
 
 def test_config_change_while_armed_requests_a_rearm():
-    """待命中换默认输入/插拔耳机，预备的引擎图就过期了。不自杀重臂的话，GO 那一刻
-    start() 抛错，用户那一句话整个丢掉。GO 之后必须退订——录音中的行为要和冷启动
-    完全一致。"""
+    """If the default input changes or headphones are plugged in while armed, the
+    prepared engine graph is stale. Without an exit and re-arm, start() throws at
+    GO and the whole utterance is lost. Unsubscribe after GO: behavior during
+    recording must be identical to a cold start."""
     code = SWIFT.read_text(encoding="utf-8")
 
     assert "AVAudioEngineConfigurationChange" in code, "没订阅设备变化通知"

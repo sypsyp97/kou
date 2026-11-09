@@ -2,20 +2,25 @@ import AVFoundation
 import CoreML
 import Foundation
 
-// 这个二进制装出来叫 `zh-voice-audio`，两个子命令：
-//   record   AVAudioEngine 原生录音（Apple 的语音处理：回声消除 / AGC / 波束成形）
-//   analyze  Silero VAD 判定 + 可选裁剪（不带子命令时也走这条，保持旧调用形式可用）
+// The installed binary is named `zh-voice-audio`. Subcommands:
+//   record   native recording with AVAudioEngine (Apple voice processing: echo
+//            cancellation, AGC, beamforming)
+//   analyze  Silero VAD decision plus optional trim (also the default when no
+//            subcommand is given)
+//   arm      prepare the recorder and wait for SIGUSR1 before capture
 //
-// 录音为什么不继续用 sox：sox 是 Hammerspoon 的子进程，麦克风授权含混地挂在
-// Hammerspoon 名下；而且它拿不到 Apple 的 voice processing。嵌进 __TEXT 的
-// Info.plist + ad-hoc 签名让这个裸二进制有自己的 bundle id，TCC 授权落在它自己头上。
+// The binary records natively and not through sox: sox cannot use Apple voice
+// processing, and the microphone permission would belong to the parent process.
+// An Info.plist embedded in __TEXT plus an ad-hoc signature gives this bare
+// binary its own bundle id, so the TCC grant belongs to the binary itself.
 //
 // Exit codes are part of the shell-client contract:
 //   0 = speech present, 3 = no speech, 2 = detector/model/audio error.
 private let noSpeechExit: Int32 = 3
-// arm 模式的退出码契约（init.lua 靠它分辨"怎么退的"）：
-//   5 = 待命中被 SIGINT/SIGTERM 解除，一个字节都没录，也没写任何文件
-//   6 = 待命中音频设备/路由变了，预备的引擎图已过期，调用方应重新预备
+// Exit codes of arm mode (the caller uses them to tell how the process ended):
+//   5 = disarmed by SIGINT/SIGTERM while waiting; no audio recorded, no file written
+//   6 = the audio device or route changed while waiting; the prepared engine
+//       graph is stale and the caller must arm again
 private let disarmedExit: Int32 = 5
 private let staleArmExit: Int32 = 6
 
@@ -250,7 +255,8 @@ private struct DetectionResult: Encodable {
     }
 }
 
-/// 每一项都能用环境变量盖掉；默认值是 Silero 官方通用默认 + 两级规则的实测取值。
+/// Each value can be overridden by an environment variable. The defaults are the
+/// Silero general defaults plus the measured values of the two-tier rule.
 private struct VADSettings {
     let onset: Float
     let offset: Float
@@ -264,22 +270,24 @@ private struct VADSettings {
         let onset = try floatSetting("ZH_VOICE_VAD_THRESHOLD", default: 0.5)
         let offset = try floatSetting("ZH_VOICE_VAD_OFFSET", default: 0.35)
         let minimum = try intSetting("ZH_VOICE_VAD_MIN_SPEECH_MS", default: 250)
-        // 两级规则：Silero 官方自己说 0.5/250ms 只是通用默认，要按数据调。
-        // 「好」「对」「嗯」这种单字挂在 250ms 的门槛上，所以给一条"概率够高就放宽
-        // 最短时长"的快车道；普通概率仍然要满 250ms，免得键盘声、碰麦克风被放行。
+        // Two-tier rule. Silero says that 0.5/250 ms is only a general default
+        // that needs tuning on data. A single-syllable word such as "好", "对" or
+        // "嗯" sits at the 250 ms threshold. So a fast lane relaxes the minimum
+        // duration when the probability is high enough. A normal probability
+        // still needs the full 250 ms, so that key clicks and microphone bumps do
+        // not pass.
         //
-        // **0.75 是在这只麦克风上标定出来的，不是抄来的通用值。**
-        // 第一版照抄了 0.85，实测一次单字「好。」是 max_probability=0.833 —— 差一点没够到，
-        // 快车道没生效，靠常规门槛的 256ms 过关（只比 250ms 多 6ms，等于走在悬崖边）。
-        // 本机四个真实数据点：长句 1.00 / 单字 0.833 / 按了没说话 0.108 /
-        // 合成白噪声 0.028。语音侧最低 0.83、噪声侧最高 0.11，中间隔了 7 倍，
-        // 所以把线画在 0.75 既能接住单字，离噪声也还很远。
+        // 0.75 is calibrated on the target microphone. It is not a generic value.
+        // Measured data points: long sentence 1.00, single word "好。" 0.833, key
+        // press without speech 0.108, synthetic white noise 0.028. The lowest
+        // speech value (0.83) is about 7 times the highest noise value (0.11).
+        // A threshold of 0.75 accepts single words and stays far from noise.
         let strong = try floatSetting("ZH_VOICE_VAD_STRONG_THRESHOLD", default: 0.75)
         let strongMinimum = try intSetting(
             "ZH_VOICE_VAD_STRONG_MIN_SPEECH_MS", default: 128)
-        // 段内允许的静音：低于这个长度的停顿不算段结束，免得一句话被切成好几段。
+        // Silence allowed inside a segment: a pause shorter than this does not end the segment, so one sentence is not split into several.
         let minimumSilence = try intSetting("ZH_VOICE_VAD_MIN_SILENCE_MS", default: 100)
-        // 裁剪时首尾各留这么多，别把字头字尾削掉。
+        // Padding kept at each end when trimming, so that the start and end of a word are not cut.
         let pad = try intSetting("ZH_VOICE_VAD_SPEECH_PAD_MS", default: 160)
 
         guard onset > 0, onset <= 1, offset >= 0, offset < onset,
@@ -320,11 +328,11 @@ private struct Analysis {
     let trimmedSamples: [Float]
 }
 
-/// 扫完整段音频，给出语音区间和裁剪点。
+/// Scan the whole audio and return the speech segments and the trim points.
 ///
-/// 和原来那版的区别：原来一旦累计够 minimumFrames 就立刻 return true（当闸门够用，
-/// 也快）。现在要输出区间来裁静音，就必须走完——Silero 是有状态的 RNN，不能倒着扫，
-/// 想知道最后一段语音在哪结束只有正向扫到底这一条路。
+/// The scan cannot stop early. Silero is a stateful RNN and cannot scan backward,
+/// so the only way to find where the last speech segment ends is to scan forward
+/// to the end.
 private func analyze(samples: [Float], modelURL: URL,
                      settings: VADSettings) throws -> Analysis {
     let detector = try SileroVAD(modelURL: modelURL)
@@ -333,10 +341,10 @@ private func analyze(samples: [Float], modelURL: URL,
     let silenceFrames = max(1, Int(ceil(Double(settings.minimumSilenceMs) / 32.0)))
 
     var maxProbability: Float = 0
-    var candidateStart: Int?          // 越过 onset、但还没满最短时长的一段
+    var candidateStart: Int?          // a span above onset that has not yet reached the minimum duration
     var candidateLength = 0
     var candidatePeak: Float = 0
-    var confirmedStart: Int?          // 已经确认是语音的一段
+    var confirmedStart: Int?          // a span already confirmed as speech
     var pendingSilence = 0
     var segmentsInSamples = [(start: Int, end: Int)]()
     var usedStrongRule = false
@@ -376,7 +384,7 @@ private func analyze(samples: [Float], modelURL: URL,
             candidatePeak = max(candidatePeak, probability)
         }
 
-        // 候选转正：段内出现过 >= strong 的帧就走快车道，否则按常规最短时长。
+        // Promote the candidate: if any frame in the span reached the strong threshold, use the fast lane. Otherwise use the normal minimum duration.
         if confirmedStart == nil, let start = candidateStart {
             let strong = candidatePeak >= settings.strongThreshold
             if candidateLength >= (strong ? strongFrames : normalFrames) {
@@ -392,7 +400,7 @@ private func analyze(samples: [Float], modelURL: URL,
         frameIndex += 1
     }
 
-    if let start = confirmedStart {       // 说到最后一刻都没停
+    if let start = confirmedStart {       // speech continues to the very end
         segmentsInSamples.append((start: start * SileroVAD.chunkSize,
                                   end: samples.count))
     }
@@ -423,7 +431,7 @@ private func analyze(samples: [Float], modelURL: URL,
     return Analysis(result: result, trimmedSamples: trimmedSamples)
 }
 
-/// 写一个 16k/mono/16-bit 的 WAV。只用来落裁剪结果，所以格式写死。
+/// Write a 16 kHz mono 16-bit WAV. It stores only trim results, so the format is fixed.
 private func writeWav(samples: [Float], to url: URL) throws {
     let byteCount = samples.count * 2
     var data = Data(capacity: 44 + byteCount)
@@ -440,8 +448,10 @@ private func writeWav(samples: [Float], to url: URL) throws {
         u16(UInt16(bitPattern: Int16(clamped * 32_767.0)))
     }
 
-    // 先写临时文件再原子替换：中途崩了也不会留下半截 WAV 顶替原音频。
-    // 录音可能跨过缓存清理（目录被整个删掉），落盘前补建父目录。
+    // Write a temporary file, then replace atomically: a crash in between never
+    // leaves a partial WAV in place of the original audio.
+    // A cache cleanup can delete the whole directory during a recording, so create
+    // the parent directory before writing.
     let tmp = url.appendingPathExtension("vadtmp")
     try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
                                             withIntermediateDirectories: true,
@@ -462,8 +472,8 @@ private func ensureMicrophonePermission() throws {
         throw VADError.recording(
             "麦克风权限被拒。系统设置 → 隐私与安全性 → 麦克风，打开「本地语音输入」")
     case .notDetermined:
-        // 第一次跑会弹系统对话框。授权落在这个二进制自己的 bundle id 上
-        // （local.zh-voice.audio），不再挂在 Hammerspoon 名下。
+        // The first run shows a system dialog. The grant belongs to the bundle id
+        // of this binary (local.zh-voice.audio).
         let decision = DispatchSemaphore(value: 0)
         var granted = false
         AVCaptureDevice.requestAccess(for: .audio) { allowed in
@@ -497,27 +507,34 @@ private final class AudioRecorder {
         self.levelURL = levelURL
     }
 
-    /// 配置引擎但**不开始采集**。实测这一半（inputNode + setVoiceProcessingEnabled +
-    /// prepare）要 ~590ms，占了整个启动损失的八成——arm 模式把它提前到按键之前付掉。
-    /// 配置完等多久都没有一个 buffer（实测 400ms 零回调），所以待命不占麦克风。
+    /// Configure the engine but do NOT start capture. This half (inputNode +
+    /// setVoiceProcessingEnabled + prepare) takes ~590 ms, about 80% of the start
+    /// delay. Arm mode pays it before the key press. After configuration no
+    /// buffer arrives (400 ms measured with zero callbacks), so waiting does not
+    /// use the microphone.
     func configure(requestVoiceProcessing: Bool) throws {
         let input = engine.inputNode
         if requestVoiceProcessing {
-            // 回声消除、自动增益、波束成形。**默认关掉**（2026-08-24）：AGC 在静音房间里
-            // 把底噪抬了 46dB（同一间屋子 3s 实测 RMS 0.031-0.061 vs 关掉后 0.00013），
-            // 也就是说它一直在大幅改写增益，而开会时别人听到的麦克风是小的。
-            // 关掉后回到 sox 时代的单位增益，电平标定（0.0008/0.020）本来就是那时候量的；
-            // VAD 和 ASR 实测不受影响（合成语音压到 RMS 0.003 仍 max_probability=1.0、转写逐字正确）。
-            // 代价：外放声音会被录进来（没有 AEC 了）。
-            // 拿不到也不该让录音失败——降级记下来，照录。
+            // Echo cancellation, AGC, beamforming. OFF by default: in a silent room
+            // the AGC raises the noise floor by 46 dB (3 s in the same room:
+            // RMS 0.031-0.061 with it, 0.00013 without), so it rewrites the gain
+            // heavily. Without it the gain is unity, and the level calibration
+            // (0.0008/0.020) assumes unity gain. VAD and ASR are not affected:
+            // synthetic speech at RMS 0.003 still gives max_probability=1.0 and an
+            // exact transcript.
+            // Cost: speaker output is recorded (no AEC).
+            // If voice processing is unavailable, recording must not fail. Record
+            // the degradation and keep recording.
             do {
                 try input.setVoiceProcessingEnabled(true)
                 voiceProcessingActive = input.isVoiceProcessingEnabled
                 if !voiceProcessingActive { degraded.append("voice_processing_unavailable") }
-                // 开 VP 的那一刻就注册成 ducking 客户端，其它音频被压到 −15dB，而且
-                // **跟引擎有没有在跑无关**——预备式待命着不采集也照压（本机实测 scalar
-                // 0.178，视频/外放一直是闷的）。.min 把它降到 −4dB（0.631）。
-                // ⚠️ enableAdvancedDucking 必须是 false：设 true 会把 .min 吃掉、退回 −15dB。
+                // Enabling VP registers the process as a ducking client at once.
+                // Other audio drops to -15 dB, whether or not the engine runs: an
+                // armed recorder that does not capture still ducks (scalar 0.178
+                // measured). .min reduces this to -4 dB (0.631).
+                // enableAdvancedDucking must be false: true ignores .min and falls
+                // back to -15 dB.
                 input.voiceProcessingOtherAudioDuckingConfiguration =
                     AVAudioVoiceProcessingOtherAudioDuckingConfiguration(
                         enableAdvancedDucking: false, duckingLevel: .min)
@@ -528,7 +545,7 @@ private final class AudioRecorder {
                 degraded.append("voice_processing_error")
             }
         }
-        // 格式必须在设完 voice processing **之后**再问：开启它会换掉输入格式。
+        // Query the format AFTER voice processing is set: enabling it changes the input format.
         let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw VADError.recording("默认输入设备没有可用声道（先看麦克风权限）")
@@ -545,7 +562,7 @@ private final class AudioRecorder {
         engine.prepare()
     }
 
-    /// 真正开始采集。GO→第一个 buffer 实测恒定 ~170ms，冷热一样——这是压不掉的下限。
+    /// Start capture. The delay from GO to the first buffer is a constant ~170 ms, cold or warm. This is the lower limit.
     func startCapture() throws {
         do {
             try engine.start()
@@ -554,7 +571,7 @@ private final class AudioRecorder {
             inputNode = nil
             throw VADError.recording(error.localizedDescription)
         }
-        // 电平从这里才开始写：待命阶段一个字节都不落盘，条子动了 = 真的在采集。
+        // Write the level only from here. The armed phase writes no byte, so a moving level bar means real capture.
         startLevelTimer()
     }
 
@@ -570,14 +587,15 @@ private final class AudioRecorder {
         var mono = [Float](repeating: 0, count: frames)
         var squareSum: Double = 0
         for frame in 0 ..< frames {
-            // 只取 0 号声道。VoiceProcessingIO 在 macOS 上会多出辅助声道，
-            // 把它们平均进来等于把回声参考信号又折回录音里。
+            // Use channel 0 only. VoiceProcessingIO on macOS adds auxiliary
+            // channels, and averaging them in would fold the echo reference
+            // signal back into the recording.
             let value = channels[0][frame]
             mono[frame] = value
             squareSum += Double(value * value)
         }
         let rms = Float((squareSum / Double(frames)).squareRoot())
-        // 和原来 island.lua 读 wav 尾部时用的是同一组标定值，所以岛的观感不变。
+        // Level calibration: RMS 0.0008 maps to 0 and RMS 0.020 maps to 1.
         let normalized = max(0, min(1, (rms - 0.0008) / (0.020 - 0.0008)))
         lock.lock()
         captured.append(contentsOf: mono)
@@ -620,8 +638,8 @@ private final class AudioRecorder {
         return result
     }
 
-    /// 只给 `zh-voice` 独立录音那条路用（原来是 sox 的 `silence` 效果）。
-    /// 热键路径不用它——什么时候停由你再按一下决定。
+    /// Used only by the standalone recording path of `zh-voice`. The hotkey path
+    /// does not use it: the next key press decides when to stop.
     func reachedSilenceEndpoint(after seconds: Double) -> Bool {
         lock.lock(); defer { lock.unlock() }
         return heardSound
@@ -683,7 +701,7 @@ private func recordCommand(_ rawArguments: [String], armed: Bool = false) throws
     var levelPath: String?
     var maximumSeconds = 120.0
     var autoStopSilence: Double?
-    var voiceProcessing = false   // 见 AudioRecorder.configure：AGC 抬底噪 46dB，默认不开
+    var voiceProcessing = false   // see AudioRecorder.configure: AGC raises the noise floor by 46 dB, so it is off by default
 
     func next(_ flag: String) throws -> String {
         guard !arguments.isEmpty else { throw VADError.invalidSetting("\(flag) 缺参数") }
@@ -704,7 +722,7 @@ private func recordCommand(_ rawArguments: [String], armed: Bool = false) throws
             }
             autoStopSilence = v
         case "--voice-processing": voiceProcessing = true
-        case "--no-voice-processing": voiceProcessing = false   // 已是默认，留着不破旧调用
+        case "--no-voice-processing": voiceProcessing = false   // already the default; kept so existing callers still work
         default:
             guard outputPath == nil, !argument.hasPrefix("--") else { throw VADError.usage }
             outputPath = argument
@@ -720,16 +738,17 @@ private func recordCommand(_ rawArguments: [String], armed: Bool = false) throws
     let recorder = AudioRecorder(levelURL: levelURL)
     let stop = DispatchSemaphore(value: 0)
     let signalQueue = DispatchQueue(label: "local.zh-voice.audio-signals")
-    // 忽略默认处置，改用 DispatchSource 接管：这样收到 SIGINT 时能把 wav 写完再退，
-    // 和调用方对 sox 的期待一致（init.lua 就是靠 task:interrupt() 停录音的）。
+    // Ignore the default disposition and handle the signals with DispatchSource.
+    // On SIGINT the process then finishes writing the wav before it exits, as a
+    // caller expects from a recorder that is stopped by interrupt.
     signal(SIGINT, SIG_IGN)
     signal(SIGTERM, SIG_IGN)
     let interrupt = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
     let terminate = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
 
     if armed {
-        // ── 待命段：配好引擎图（贵的那 ~590ms），然后等 GO ───────────────
-        // 三种唤醒相互竞争，谁先到听谁的；wake 只在 signalQueue 上写，读也走它。
+        // ── Armed phase: configure the engine graph (the expensive ~590 ms), then wait for GO ──
+        // Three wake reasons compete and the first one wins. wake is written only on signalQueue, and read through it.
         enum Wake { case go, disarm, stale }
         var wake = Wake.disarm
         let armSem = DispatchSemaphore(value: 0)
@@ -743,9 +762,12 @@ private func recordCommand(_ rawArguments: [String], armed: Bool = false) throws
 
         try recorder.configure(requestVoiceProcessing: voiceProcessing)
 
-        // 待命期间音频路由变了（换默认输入、插拔耳机），预备的图就过期了：
-        // 退出让调用方重新预备，好过 GO 之后才发现 start() 抛错。通知到达线程不定，
-        // 挪到 signalQueue 上再碰 wake。GO 之后立刻退订，录音中的行为和冷启动完全一致。
+        // If the audio route changes while armed (new default input, headphones
+        // plugged in or out), the prepared graph is stale. Exit so that the caller
+        // arms again; this is better than a start() error after GO. The
+        // notification arrives on any thread, so move to signalQueue before
+        // touching wake. Unsubscribe right after GO, so that behavior during
+        // recording is identical to a cold start.
         let staleObserver = NotificationCenter.default.addObserver(
             forName: .AVAudioEngineConfigurationChange, object: nil, queue: nil) { _ in
             signalQueue.async { wake = .stale; armSem.signal() }
@@ -759,17 +781,17 @@ private func recordCommand(_ rawArguments: [String], armed: Bool = false) throws
         NotificationCenter.default.removeObserver(staleObserver)
         switch reason {
         case .disarm:
-            return disarmedExit          // 一个字节都没录，没有任何文件要收
+            return disarmedExit          // nothing recorded, no file to collect
         case .stale:
             return staleArmExit
         case .go:
             break
         }
-        // GO 之后 SIGINT/SIGTERM 变回"停止录音"：换回录音段的处理器。
+        // After GO, SIGINT/SIGTERM mean "stop recording" again: switch to the recording handlers.
         interrupt.setEventHandler { stop.signal() }
         terminate.setEventHandler { stop.signal() }
         goSource.cancel()
-        try recorder.startCapture()      // 抛错 → exit 2，调用方退回冷启动
+        try recorder.startCapture()      // on error: exit 2, the caller falls back to a cold start
     } else {
         interrupt.setEventHandler { stop.signal() }
         terminate.setEventHandler { stop.signal() }
@@ -814,7 +836,7 @@ private func analyzeCommand(_ rawArguments: [String]) throws -> Int32 {
     while let first = arguments.first, first.hasPrefix("--") {
         switch first {
         case "--json": wantsJSON = true
-        case "--trim": wantsTrim = true          // 原地裁掉首尾静音
+        case "--trim": wantsTrim = true          // trim leading and trailing silence in place
         default: throw VADError.usage
         }
         arguments.removeFirst()
@@ -833,7 +855,7 @@ private func analyzeCommand(_ rawArguments: [String]) throws -> Int32 {
     }
     let analysis = try analyze(samples: audio.samples, modelURL: modelURL,
                                settings: try VADSettings.fromEnvironment())
-    // 只有确实有语音、且确实裁掉了东西，才回写；没语音时原样留着交给调用方处置。
+    // Write back only if speech exists and something was trimmed. With no speech, leave the file unchanged for the caller.
     if wantsTrim, analysis.result.speech, analysis.result.trimmed {
         try writeWav(samples: analysis.trimmedSamples, to: wavURL)
     }
@@ -856,15 +878,17 @@ private func run() throws -> Int32 {
         arguments.removeFirst()
         return try recordCommand(arguments, armed: true)
     }
-    // 不带子命令 = analyze。旧的 `zh-voice-vad [--json] wav model` 调用形式保持可用。
+    // No subcommand means analyze, so `zh-voice-vad [--json] wav model` still works.
     if arguments.first == "analyze" { arguments.removeFirst() }
     return try analyzeCommand(arguments)
 }
 
-_ = umask(0o077)          // 这个进程写出去的东西一律 0600，不指望每个调用点都记得
-// SIGUSR1 的默认处置是杀进程，而它是 arm 模式的 GO 信号。SIG_IGN 放在程序入口而不是
-// arm 分支里：实测信号能赶在参数解析之前到，那时进程就被无声杀掉了。真正的保证是
-// 握手（调用方见到 ARMED 才发 GO），这里只是把意外的早到信号变成无害。
+_ = umask(0o077)          // everything this process writes is mode 0600, without relying on each call site
+// The default disposition of SIGUSR1 kills the process, and SIGUSR1 is the GO
+// signal of arm mode. Set SIG_IGN at program entry, not in the arm branch: the
+// signal can arrive before argument parsing, and the process would die silently.
+// The real guarantee is the handshake (the caller sends GO only after it sees
+// ARMED). This line only makes an unexpected early signal harmless.
 signal(SIGUSR1, SIG_IGN)
 do {
     exit(try run())

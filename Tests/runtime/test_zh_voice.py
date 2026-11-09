@@ -210,15 +210,17 @@ def test_terms_file_comments_are_stripped_from_context(harness):
 
 # --- 55 ------------------------------------------------------------------
 def test_context_uses_the_measured_wrapper_not_a_bare_space_joined_list(harness):
-    """术语表的**措辞**本身影响很大，不是风格问题。
+    """The wording of the term list has a large effect.
 
-    一组 184 次转写、跑在同一个模型（mlx-community/Qwen3-ASR-1.7B-8bit）上的实测：空格
-    拼成一串是 4 段音频均值 WER 33.8%、术语泄漏 1/4，而 `Technical terms: a, b, c.` 是
-    18.2%、泄漏 0/4。最难那段里空格拼串 87.5%，比**完全不给 context**（78.1%）还差——
-    也就是说裸列表在难音频上是负收益。
+    Measured: 184 transcriptions with the same model
+    (mlx-community/Qwen3-ASR-1.7B-8bit). Terms joined by spaces give a mean WER of
+    33.8% over 4 clips and a term leak of 1/4. `Technical terms: a, b, c.` gives
+    18.2% and a leak of 0/4. On the hardest clip, space-joined gives 87.5%, worse
+    than no context (78.1%). So a bare list hurts on hard audio.
 
-    前缀也不能随便换：同组实验里八个替代前缀全部退回裸列表水平，只有 Technical terms:／
-    Vocabulary:／Proper nouns: 三个过关。所以这里钉住默认值。
+    Do not change the prefix. In the same experiment eight other prefixes fell
+    back to the bare-list level. Only Technical terms:, Vocabulary: and Proper
+    nouns: passed. This test pins the default.
     """
     harness.write_terms("LIBERO\nsbatch\nmLSTM\n")
     wav = harness.wav(seconds=1.0)
@@ -239,8 +241,8 @@ def test_context_uses_the_measured_wrapper_not_a_bare_space_joined_list(harness)
 
 # --- 56 ------------------------------------------------------------------
 def test_a_terms_file_with_only_comments_passes_no_context_at_all(harness):
-    """加了前缀之后新出现的边界：只剩注释的术语表不能变成一个空壳
-    `Technical terms: .` —— 那是给模型一个没有内容的先验，纯噪声。"""
+    """Edge case of the prefix: a terms file with only comments must not become an
+    empty shell `Technical terms: .`, which gives the model a prior without content."""
     harness.write_terms("# 全是注释\n#\n\n   \n")
     wav = harness.wav(seconds=1.0)
 
@@ -332,7 +334,7 @@ def test_output_is_a_single_trimmed_line(harness):
 
 # --- 38 ------------------------------------------------------------------
 def test_health_says_healthy_when_the_daemon_answers_ping(harness):
-    """`zh-voice --health` 是 deploy.sh 的上线闸门，也是人自查的入口。"""
+    """`zh-voice --health` is the go-live gate of the installer and the manual self-check."""
     harness.live_daemon(
         reply=lambda req: ("PONG stub/model" if req.startswith("PING")
                            else "不该走到这里"))
@@ -350,10 +352,11 @@ def test_health_says_healthy_when_the_daemon_answers_ping(harness):
 
 # --- 48 ------------------------------------------------------------------
 def test_doctor_reports_each_dependency_and_fails_on_a_missing_model(harness):
-    """出问题时第一件事该是跑体检，而不是逐项猜。
+    """When something fails, run the health check first instead of guessing item by item.
 
-    模型缓存必须是 FAIL 而不是 warn：daemon 跑离线模式，缓存不在就永远起不来，而症状
-    只是「热键没反应」。
+    A missing model cache must be FAIL, not warn: the daemon runs in offline mode
+    and never starts without the cache, and the only symptom is "the hotkey does
+    nothing".
     """
     r = harness.run(["--doctor"])
 
@@ -371,8 +374,8 @@ def test_doctor_reports_each_dependency_and_fails_on_a_missing_model(harness):
 
 # --- 39 ------------------------------------------------------------------
 def test_health_fails_when_no_daemon_is_running(harness):
-    """没有 socket = daemon 没在跑。要以非 0 退出，否则 deploy.sh 会把"根本没起来"
-    当成上线成功——那正是旧版预热超时还 exit 0 的老毛病。"""
+    """No socket means no daemon is running. Exit non-zero. Otherwise the installer
+    would treat "never started" as a successful go-live."""
     r = harness.run(["--health"])
 
     assert r.returncode == 1, (
@@ -386,9 +389,9 @@ def test_health_fails_when_no_daemon_is_running(harness):
 
 # --- 40 ------------------------------------------------------------------
 def test_health_fails_on_a_socket_with_nobody_behind_it(harness):
-    """正是"进程活着、服务已死"从客户端看到的样子：socket 文件在，连不上/答不出。
+    """This is how "process alive, service dead" looks from the client: the socket file exists, but connecting fails or nothing answers.
 
-    只判断 `[ -S socket ]` 的检查会在这里报健康——旧 deploy.sh 就是这么判的。
+    A check that only tests `[ -S socket ]` would report healthy here.
     """
     sock = harness.stale_socket()
     assert sock.is_socket()
@@ -403,14 +406,15 @@ def test_health_fails_on_a_socket_with_nobody_behind_it(harness):
 
 # --- 49 ------------------------------------------------------------------
 def test_local_vad_rejects_silence_before_any_asr_path(harness):
-    """静音绝不能到达带术语表的识别器。
+    """Silence must never reach the recognizer that has a term list.
 
-    本机实测过：喂它底噪/风扇声/白噪声，配上线上那份 506 字符的 context，模型会把
-    **整份术语表**当成转写结果吐出来，然后被自动粘贴到当前 app。所以闸门要卡在
-    两条 ASR 路径之前，而不是事后过滤。
+    Measured: with noise, fan sound or white noise and the production 506-character
+    context, the model outputs the WHOLE term list as the transcript, and the caller
+    pastes it into the active app. So the gate must sit before both ASR paths and
+    not filter afterwards.
 
-    契约是「退出码 0 + 不输出 + stderr 也空」：init.lua 对这个组合已经有分支，
-    显示"没听清，再说一次"，一个字都不粘。
+    The contract is "exit code 0, no output, empty stderr". The caller treats this
+    combination as "not heard" and pastes nothing.
     """
     harness.live_daemon(reply="Technical terms: LIBERO, sbatch, mLSTM.")
     harness.write_terms("LIBERO\nsbatch\nmLSTM\n")
@@ -440,10 +444,11 @@ def test_local_vad_lets_speech_through(harness):
 
 # --- 51 ------------------------------------------------------------------
 def test_vad_runtime_error_fails_open(harness):
-    """检测器自己出错时必须照常转写。
+    """If the detector itself fails, transcription must continue.
 
-    反过来（fail-closed）会让一次探测失败直接吃掉一句真话，而用户看到的只是
-    "没听清"——这种静默丢字比偶尔漏过一次噪声难查得多。
+    The opposite (fail-closed) would let one failed probe swallow a real
+    utterance, and the user would only see "not heard". Silent loss of speech is
+    much harder to diagnose than an occasional noise that passes.
     """
     harness.live_daemon(reply="检测器坏了也不能丢语音")
     wav = harness.wav(name="speech.wav", seconds=1.0)
@@ -457,7 +462,7 @@ def test_vad_runtime_error_fails_open(harness):
 
 # --- 52 ------------------------------------------------------------------
 def test_missing_vad_model_fails_open_without_tripping_set_e(harness):
-    """模型缓存没了也要能听写。`set -euo pipefail` 下这条最容易写成静默退出。"""
+    """Dictation must still work without the model cache. Under `set -euo pipefail` this path easily turns into a silent exit."""
     harness.live_daemon(reply="缓存没了也不能丢语音")
     wav = harness.wav(name="speech.wav", seconds=1.0)
 
@@ -472,10 +477,11 @@ def test_missing_vad_model_fails_open_without_tripping_set_e(harness):
 
 # --- 53 ------------------------------------------------------------------
 def test_term_list_echo_is_swallowed_not_pasted(harness):
-    """VAD 之后的第二道网：闸门是 fail-open 的，泄漏那条路并没被完全堵死。
+    """Second net after the VAD: the gate fails open, so the leak path is not fully closed.
 
-    模型照着 context 念的时候输出是术语表的前缀（被 max token 截断），而且前面常带
-    一个"技术术语："标签、标点是全角。这三种形态都要认得出来。
+    When the model recites the context, the output is a prefix of the term list
+    (cut by the max-token limit), often with a leading label such as "技术术语：" and
+    full-width punctuation. All three forms must be recognized.
     """
     harness.live_daemon(
         reply="技术术语：LIBERO，sbatch，mLSTM，checkpoint")
@@ -491,7 +497,7 @@ def test_term_list_echo_is_swallowed_not_pasted(harness):
 
 # --- 54 ------------------------------------------------------------------
 def test_real_speech_that_merely_mentions_a_term_is_kept(harness):
-    """上面那张网不能宽到吃掉正常说话——他本来就一天到晚在说这些词。"""
+    """The net above must not be so wide that it swallows normal speech: the speaker uses these words all day."""
     harness.live_daemon(reply="LIBERO 那个 checkpoint 我等下再看")
     harness.write_terms("LIBERO\nsbatch\nmLSTM\ncheckpoint\nbenchmark\n")
     wav = harness.wav(seconds=1.0)
@@ -502,10 +508,11 @@ def test_real_speech_that_merely_mentions_a_term_is_kept(harness):
     assert r.stdout.strip() == "LIBERO 那个 checkpoint 我等下再看"
 
 
-# --- 65 --- 2026-07-29：私密临时文件 / 裁剪 / 指标 / 回声重试 --------------
+# --- 65 --- private temp files / trimming / metrics / echo retry ------------
 def test_vad_is_asked_for_json_and_trim(harness):
-    """裁掉首尾静音不是锦上添花：长停顿正是 ASR 产生幻觉的温床，而且送进去的
-    音频越短，转写越快。所以闸门那一趟顺手把 --trim 带上。"""
+    """Trimming leading and trailing silence is not optional. Long pauses cause ASR
+    hallucination, and shorter audio transcribes faster. So the gate pass also
+    passes --trim."""
     harness.live_daemon(reply="裁过之后的正常语音")
     wav = harness.wav(seconds=1.0)
 
@@ -528,8 +535,8 @@ def test_vad_trim_can_be_turned_off(harness):
 
 
 def test_metrics_record_numbers_but_never_the_transcript(harness, tmp_path):
-    """指标是为了分清"没听清"到底是谁吃掉的。但**绝不能**把转写文本抄进去——
-    这一轮做的事就是把音频从磁盘上清掉，没道理换个地方又把内容写下来。"""
+    """Metrics tell apart which stage swallowed an utterance. They must NEVER
+    contain the transcript text or the audio path."""
     secret = "这句话绝对不能出现在指标里"
     harness.live_daemon(reply=secret)
     metrics = tmp_path / "metrics.log"
@@ -561,13 +568,13 @@ def test_metrics_distinguish_a_vad_gated_utterance(harness, tmp_path):
 
 
 def test_reordered_term_echo_is_retried_without_context_and_recovered(harness):
-    """判据二：不是前缀、但内容大部分直接来自术语表 —— 模型在乱序照念。
+    """Criterion 2: the text is not a prefix but mostly consists of terms from the list. The model recites them in another order.
 
-    这种情况下不再直接丢掉，而是**不带 context 重转一次**：闸门是 fail-open 的，
-    底下真有可能有话，只是被术语偏置盖过去了。
+    Do not drop it at once. Transcribe once more WITHOUT context: the gate fails
+    open, so real speech may exist and the term bias may have covered it.
     """
     def by_context(request):
-        # 协议是两行：wav 路径 + context。带偏置时照念术语表，不带时说人话。
+        # The protocol has two lines: wav path and context. With the bias the stub recites the term list. Without it the stub returns plain speech.
         lines = request.split("\n")
         context = lines[1] if len(lines) > 1 else ""
         if context.strip():
@@ -586,7 +593,7 @@ def test_reordered_term_echo_is_retried_without_context_and_recovered(harness):
 
 
 def test_term_echo_still_dropped_when_retry_is_also_an_echo(harness):
-    """重试回来还是照念术语表 —— 那就真的没有话，走和静音一样的契约。"""
+    """If the retry also recites the term list, there is no speech. Follow the same contract as silence."""
     harness.live_daemon(reply="mLSTM，checkpoint，sbatch，benchmark")
     harness.write_terms("LIBERO\nsbatch\nmLSTM\ncheckpoint\nbenchmark\n")
     wav = harness.wav(seconds=1.0)
@@ -599,7 +606,7 @@ def test_term_echo_still_dropped_when_retry_is_also_an_echo(harness):
 
 
 def test_real_speech_mentioning_three_terms_is_not_mistaken_for_an_echo(harness):
-    """覆盖率那条判据必须收得住：他本来就一天到晚在说这些词。"""
+    """The coverage criterion must stay tight: the speaker uses these words all day."""
     harness.live_daemon(reply="LIBERO 的 checkpoint 和 benchmark 我等下一起看")
     harness.write_terms("LIBERO\nsbatch\nmLSTM\ncheckpoint\nbenchmark\n")
     wav = harness.wav(seconds=1.0)
@@ -611,9 +618,11 @@ def test_real_speech_mentioning_three_terms_is_not_mistaken_for_an_echo(harness)
 
 
 def test_speech_with_full_term_list_appended_is_retried_and_recovered(harness):
-    """判据三：真话说完，术语表整段贴在后面。判据一拦不住（不是前缀），
-    判据二也拦不住（真话把覆盖率稀释到 75% 以下）——2026-08-14 实测泄漏过一次：
-    10.8s 语音出 582 字，整段被粘进当时聚焦的 app。"""
+    """Criterion 3: real speech followed by the whole term list.
+
+    Criterion 1 misses it (not a prefix), and criterion 2 misses it (the real
+    speech dilutes coverage below 75%). Example: 10.8 s of speech produced 582
+    characters, and the whole text was pasted into the focused app."""
     def by_context(request):
         lines = request.split("\n")
         context = lines[1] if len(lines) > 1 else ""
@@ -636,7 +645,7 @@ def test_speech_with_full_term_list_appended_is_retried_and_recovered(harness):
 
 
 def test_real_speech_ending_with_a_short_term_list_is_not_an_echo(harness):
-    """判据三必须收得住：句尾真的连报三个术语（不到 60 字）是日常说法。"""
+    """Criterion 3 must stay tight: naming three terms in a row at the end of a sentence (under 60 characters) is normal speech."""
     said = "我一会儿把下面三个环境统统跑一遍再汇报，LIBERO-Pro，RoboCasa，MIKASA"
     harness.live_daemon(reply=said)
     harness.write_terms("LIBERO-Pro\nRoboCasa\nMIKASA\ncheckpoint\nbenchmark\n"
@@ -895,8 +904,9 @@ def test_decoding_loop_cli_retry_is_dropped_without_context(harness, tmp_path):
 
 
 def test_cli_fallback_loads_the_pinned_snapshot_by_path(harness):
-    """`--model <repo id>` 让 huggingface_hub 去读 refs/main，钉不住版本。缓存里有钉死的
-    那个 snapshot 时，要把**它的路径**交给 CLI（load_model 的形参就叫 path_or_hf_repo）。"""
+    """`--model <repo id>` makes huggingface_hub read refs/main, which does not pin the
+    version. If the pinned snapshot is in the cache, pass ITS PATH to the CLI (the
+    load_model parameter is path_or_hf_repo)."""
     rev = "d" * 40
     snap = (harness.home / ".cache" / "huggingface" / "hub"
             / "models--stub--model" / "snapshots" / rev)
@@ -915,8 +925,9 @@ def test_cli_fallback_loads_the_pinned_snapshot_by_path(harness):
 
 
 def test_cli_fallback_still_transcribes_when_the_pin_is_missing(harness):
-    """钉死的 snapshot 不在时宁可版本没钉住也要出字：一次听写不该因为 revision 的事
-    整条链路停摆。该拦住漂移的是 deploy 的预检（那里是 die）和 --doctor。"""
+    """If the pinned snapshot is missing, transcribe with an unpinned version rather
+    than not at all: a revision problem must not stop dictation. --doctor reports
+    the drift."""
     wav = harness.wav(seconds=1.0)
 
     r = harness.run([wav], extra_env={"STUB_ASR_STDOUT": "没钉住也照样出字"})
@@ -929,8 +940,10 @@ def test_cli_fallback_still_transcribes_when_the_pin_is_missing(harness):
 
 
 def test_doctor_reports_the_tokenizer_as_pinned_not_as_a_missing_upstream_cache(harness):
-    """钉住之后，上游那个仓库的缓存（本机 1.7 GB，99% 是我们从不加载的 0.6B 权重）就该能删。
-    体检要是还按"上游缓存在不在"报 FAIL，那就是一条**假警报**，而假警报会训练人忽略体检。"""
+    """With the pin, the cache of the upstream repo (1.7 GB locally, 99% of it 0.6B weights that are never loaded) can be deleted.
+
+    If the health check still reported FAIL for a missing upstream cache, it would
+    be a false alarm, and false alarms teach people to ignore the check."""
     rev = "a" * 40
     snap = (harness.home / ".cache" / "huggingface" / "hub"
             / "models--stub--model" / "snapshots" / rev)
@@ -946,12 +959,13 @@ def test_doctor_reports_the_tokenizer_as_pinned_not_as_a_missing_upstream_cache(
         "钉得住却没报 ok（沙箱里根本没有上游缓存，这正是删掉之后的样子）：%r" % (line[0],))
 
 
-# ── 热路径省下来的那些 spawn（2026-07-30）───────────────────────────────────
+# ── Process spawns saved on the hot path ─────────────────────────────────────
 def test_from_recorder_trusts_the_caller_and_skips_the_soxi_probes(harness):
-    """`--from-recorder` = 调用方（init.lua）保证这份 wav 是我们录音器写的 16k/mono。
+    """`--from-recorder` means the caller guarantees that the wav comes from our recorder (16 kHz mono).
 
-    三次 soxi（-r/-c 探格式、-D 查时长）问的都是已经知道的事，实测每次 6.4ms。时长下限
-    也归 init.lua 的 MIN_BYTES 管，不必在这里重判一遍。
+    The three soxi calls (-r and -c probe the format, -D reads the duration) ask
+    for facts that are already known, and each costs 6.4 ms. The caller also
+    enforces the minimum duration, so it is not checked again here.
     """
     harness.live_daemon(reply="不必再问格式")
     wav = harness.wav(seconds=1.0, rate=16000, channels=1)
@@ -966,10 +980,11 @@ def test_from_recorder_trusts_the_caller_and_skips_the_soxi_probes(harness):
 
 
 def test_without_the_flag_the_format_is_still_probed(harness):
-    """独立入口（人手给一个任意 wav）没有那个保证，格式探测必须留着。
+    """The standalone entry (any wav from the user) has no such guarantee, so the format probe must stay.
 
-    反向断言：省 spawn 不能顺手把这条路也省成"假设 16k/mono"，那样一份 44.1k 立体声
-    会被当 16k 送进 ASR，出来是快放的胡言乱语。
+    Reverse assertion: saving spawns must not turn this path into "assume 16 kHz
+    mono". A 44.1 kHz stereo file would reach the ASR as 16 kHz and produce
+    fast-forward nonsense.
     """
     harness.live_daemon(reply="探过格式")
     wav = harness.wav(seconds=1.0, rate=16000, channels=1)
@@ -981,7 +996,7 @@ def test_without_the_flag_the_format_is_still_probed(harness):
 
 
 def test_server_reported_asr_ms_is_what_lands_in_metrics(harness, tmp_path):
-    """耗时改由 daemon 自报（回复首行 META）。客户端原来那两次 perl（各 5ms）取消了。"""
+    """The daemon reports the transcription time itself (META in the first reply line). The client does not time it."""
     harness.live_daemon(reply="META asr_ms=137\n服务端计时的转写")
     metrics = tmp_path / "metrics.log"
     wav = harness.wav(seconds=1.0)
@@ -995,7 +1010,7 @@ def test_server_reported_asr_ms_is_what_lands_in_metrics(harness, tmp_path):
 
 
 def test_a_reply_without_meta_still_yields_the_transcript(harness, tmp_path):
-    """没有 META 的回复（PING、ERROR、或者哪天换个 daemon）整串就是转写，行为不变。"""
+    """A reply without META (PING, ERROR, or another daemon) is the transcript as a whole. The behavior is unchanged."""
     harness.live_daemon(reply="没有头信息的回复")
     metrics = tmp_path / "metrics.log"
     wav = harness.wav(seconds=1.0)
@@ -1009,8 +1024,9 @@ def test_a_reply_without_meta_still_yields_the_transcript(harness, tmp_path):
 
 
 def test_a_single_line_reply_that_looks_like_meta_is_not_eaten(harness):
-    """判 META 要求它后面真有换行。否则一句正好以 "META asr_ms=" 开头的转写会被
-    整行当成头信息丢掉——用户那句话就凭空消失了。"""
+    """The META check requires a real newline after it. Otherwise a transcript that
+    starts with "META asr_ms=" would be dropped as a header, and the utterance
+    would vanish."""
     harness.live_daemon(reply="META asr_ms=999")
     wav = harness.wav(seconds=1.0)
 
@@ -1022,11 +1038,13 @@ def test_a_single_line_reply_that_looks_like_meta_is_not_eaten(harness):
 
 
 def test_terms_cache_is_read_back_and_an_edit_invalidates_it(harness):
-    """术语串和它的归一化形式只随 terms.txt 变，缓存起来省掉每轮 ~15ms。
+    """The term string and its normalized form change only with terms.txt. The cache saves ~15 ms per turn.
 
-    新鲜度靠缓存第一行那个 key（terms.txt 的 mtime+大小）。这里先把缓存内容换成哨兵、
-    **保留原 key**，证明它真的在读；再改 terms.txt 证明 key 一变就重算——只测第二半的话，
-    一个永远不读缓存的实现也能通过。
+    Freshness depends on the key in the first cache line (mtime and size of
+    terms.txt). The test first replaces the cache content with a sentinel and
+    KEEPS the key, which proves that the cache is read. Then it edits terms.txt,
+    which proves that a changed key forces a recompute. With only the second half,
+    an implementation that never reads the cache would pass.
     """
     harness.write_terms("LIBERO\nsbatch\n")
     wav = harness.wav(seconds=1.0)
@@ -1043,7 +1061,7 @@ def test_terms_cache_is_read_back_and_an_edit_invalidates_it(harness):
     ctx = ctx[ctx.index("--context") + 1]
     assert "哨兵术语" in ctx, "缓存没被读：context 里应该是哨兵，实得 %r" % (ctx,)
 
-    harness.write_terms("mLSTM\nGR00T\n")       # 改动让 terms.txt 变新
+    harness.write_terms("mLSTM\nGR00T\n")       # the edit makes terms.txt newer
     r = harness.run([wav], extra_env={"STUB_ASR_STDOUT": "第三次"})
     ctx = harness.calls("mlx-qwen3-asr")[-1]
     ctx = ctx[ctx.index("--context") + 1]

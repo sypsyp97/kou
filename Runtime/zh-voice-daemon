@@ -9,14 +9,15 @@ Protocol, plain text, one request per connection:
   ->  <wav path>\n<context terms>\n
   <-  <transcript>\n        (or  ERROR: ...\n)
   ->  PING\n\n
-  <-  PONG <model>\n        健康探针，不碰模型
+  <-  PONG <model>\n        health probe, does not touch the model
 
-两层进程，理由见 worker_main：模型住在一个可丢弃的子进程里，这个父进程只管 socket
-和超时。Exits after ZH_VOICE_IDLE seconds idle so it does not hold ~3.4 GB forever;
+Two processes (see worker_main): the model lives in a disposable child process.
+This parent process handles only the socket and the timeouts. Exits after ZH_VOICE_IDLE seconds idle so it does not hold ~3.4 GB forever;
 exits 70 when the worker misses its deadline, so launchd brings up a fresh one.
 
-shebang 故意写成 env python3：源文件要能被任意 python 语法检查、也要能在测试里用
-系统 python 跑。deploy.sh 安装时会把第一行换成 uv tool 那个精确的解释器。
+The shebang is `env python3` on purpose: any Python can syntax-check the source
+and the tests can run it with the system Python. The installer replaces the
+first line with the exact interpreter of the uv tool.
 """
 import atexit
 from contextlib import contextmanager
@@ -32,38 +33,46 @@ import time
 from types import MethodType
 import wave
 
-# 运行期不该碰网络。模型是安装阶段备好的，这里钉死离线，免得 HF 在断网/弱网时把一次
-# 转写拖成几十秒的超时重试——那正好会被下面的预算判成卡死。
+# Do not touch the network at run time. The models are provisioned at install
+# time. Pin offline mode so that HF cannot stretch one transcription into tens
+# of seconds of timeout retries on a bad network, which the budget below would
+# judge as a hang.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 SOCK_PATH = os.path.expanduser(os.environ.get(
     "ZH_VOICE_SOCKET", "~/.cache/zh-voice/asr.sock"))
 MODEL = os.environ.get("ZH_VOICE_MODEL", "mlx-community/Qwen3-ASR-1.7B-8bit")
-# 运行期真正加载哪个目录。deploy.sh 把钉死的 snapshot 路径渲染进 plist —— 光把 repo id
-# 交给 huggingface_hub 是**钉不住版本的**：offline 模式下它去读 refs/main，那是"缓存里
-# 最近一次拉到的那一版"，和我们钉的 ASR_REVISION 并不是同一件事。两者一分开（上游更新
-# 过一次就会），deploy 的预检照样通过（它只查那个目录还在不在），而线上悄悄换成了另一份
-# 权重——症状是"转写忽然变差"，属于最难查的那一类。
+# The directory that is actually loaded at run time. The installer renders the
+# pinned snapshot path into the plist. A repo id alone does NOT pin a version:
+# in offline mode huggingface_hub reads refs/main, which is the most recently
+# fetched snapshot in the cache, not the pinned ASR_REVISION. After an upstream
+# update the two differ, the install pre-check still passes (it only checks that
+# the directory exists), and the daemon silently runs other weights. The only
+# symptom is worse transcription, which is hard to diagnose.
 MODEL_PATH = os.environ.get("ZH_VOICE_MODEL_PATH", "")
 IDLE_SEC = float(os.environ.get("ZH_VOICE_IDLE", "3600"))
 
-# 请求读取上限：accept 循环是单线程的，一个半开着不说话的客户端能把所有人堵死。
-# 客户端（nc）握手后立刻把两行写完，正常路径连一毫秒都用不到。
+# Request read limit. The accept loop is single-threaded, so a half-open client
+# that sends nothing would block all others. The client (nc) writes both lines
+# right after the handshake, so the normal path needs well under a millisecond.
 READ_TIMEOUT_SEC = 2.0
-# 一个不肯发换行的客户端能让 buf 无限长。正常请求是一个路径加一行术语表，64 KiB 绰绰有余。
+# A client that never sends a newline would grow buf without limit. A normal request is one path and one term-list line, so 64 KiB is enough.
 MAX_REQUEST_BYTES = 64 * 1024
 # Bound retained KV storage for unusually long context strings.
 MAX_PREFIX_TOKENS = 1024
 
-# worker 冷启动要把 3.4 GB 权重读进来，给足；超过就是真起不来了。
+# A cold worker start reads 3.4 GB of weights. Allow enough time; beyond this the worker cannot start.
 WORKER_START_TIMEOUT_SEC = float(os.environ.get("ZH_VOICE_START_TIMEOUT", "180"))
 
-# 一次转写允许的墙钟预算 = BASE + FACTOR × 音频秒数，夹在 [FLOOR, CEIL] 之间。
-# 实测热态 3.5s 音频 1.06s，FACTOR=4 是给"整机被重负载拖住"留的四倍余量：宁可多等，
-# 也不能把一句说完的话在正常情况下判成卡死。固定超时在这里不合适——录音上限是 120s，
-# 一个对短句合适的固定值会在长句上例行误杀。
-# CEIL 反过来：卡死期间客户端会退回一次性 CLI，那边再加载一份 3.4 GB，两份同时占着
-# 内存比多等一会儿更糟，所以最长也就等 3 分钟。
+# Wall-clock budget for one transcription = BASE + FACTOR x audio seconds,
+# clamped to [FLOOR, CEIL]. Measured: 3.5 s of audio takes 1.06 s when warm.
+# FACTOR=4 leaves a fourfold margin for a heavily loaded machine. Waiting longer
+# is better than judging a finished utterance as hung. A fixed timeout does not
+# fit: the recording limit is 120 s, and a value that suits short utterances
+# would kill long ones routinely.
+# CEIL works the other way. During a hang the client falls back to the one-shot
+# CLI, which loads another 3.4 GB. Two copies in memory are worse than waiting
+# a little longer, so the longest wait is 3 minutes.
 HANG_BASE = float(os.environ.get("ZH_VOICE_HANG_BASE", "10"))
 HANG_FACTOR = float(os.environ.get("ZH_VOICE_HANG_FACTOR", "4"))
 HANG_FLOOR = float(os.environ.get("ZH_VOICE_HANG_FLOOR", "25"))
@@ -73,30 +82,34 @@ last_used = time.time()
 _worker = None
 _server = None
 _health_server = None
-_loaded_from = ""        # worker 报回来的"我真的从这儿加载的"，PONG 要回显它
-_tokenizer_pinned = False   # 词表也来自那个 snapshot 吗（见 pin_tokenizer_dir）
+_loaded_from = ""        # the path the worker reports it loaded from; PONG echoes it
+_tokenizer_pinned = False   # does the tokenizer also come from that snapshot (see pin_tokenizer_dir)
 
 
 def model_target():
-    """交给 load_model 的东西。它的形参就叫 path_or_hf_repo：本地目录（且带 config.json）
-    直接用，否则退回 repo id 让 huggingface_hub 走 refs/main。
+    """Return the value to pass to load_model. Its parameter is path_or_hf_repo:
+    use a local directory (with config.json) directly. Otherwise fall back to the
+    repo id and let huggingface_hub follow refs/main.
 
-    退回是故意的：钉死的路径不在时宁可用缓存里那一版出字，也不要整条链路停摆。真正该拦住
-    版本漂移的是 deploy 的验活——它会拿 PONG 里的 rev= 和自己钉的 revision 对账，所以这个
-    退路不会变成一个**没人看得见**的退路。"""
+    The fallback is deliberate: if the pinned path is missing, transcribing with
+    the cached version is better than stopping the pipeline. The fallback is not
+    invisible: the install check compares the rev= field in PONG with the pinned
+    revision."""
     if MODEL_PATH and os.path.isfile(os.path.join(MODEL_PATH, "config.json")):
         return MODEL_PATH
     return MODEL
 
 
 def pin_tokenizer_dir(target):
-    """让词表也从 target 读，而不是上游 DEFAULT_MODEL_ID 那个仓库（transcribe() 拿到一个
-    已加载的 model 对象时用的是后者）。句柄必须从 sys.modules 取：
-    `import mlx_qwen3_asr.transcribe as T` 拿到的是 re-export 的**函数**，设属性静默失效。
-    钉不住返回 False，由 deploy 预检兜住。"""
+    """Make the tokenizer load from target, not from the upstream
+    DEFAULT_MODEL_ID repo (transcribe() uses the latter when it gets an already
+    loaded model object). Take the module handle from sys.modules:
+    `import mlx_qwen3_asr.transcribe as T` returns the re-exported FUNCTION, and
+    setting an attribute on it silently has no effect.
+    Return False if the pin is not possible; the install pre-check covers that."""
     for name in ("vocab.json", "merges.txt", "tokenizer_config.json"):
         if not os.path.isfile(os.path.join(target, name)):
-            return False        # 不是一个自带词表的本地 snapshot：没得钉
+            return False        # not a local snapshot with its own tokenizer files: nothing to pin
     module = sys.modules.get("mlx_qwen3_asr.transcribe")
     if module is None or not hasattr(module, "DEFAULT_MODEL_ID"):
         return False
@@ -105,18 +118,20 @@ def pin_tokenizer_dir(target):
 
 
 def revision_label():
-    """PONG 里那个 rev=：真正加载的 snapshot 目录名，也就是 HF 的 commit hash。
-    没钉住就说 unpinned，不假装钉住了。"""
+    """The rev= field in PONG: the name of the snapshot directory that was loaded,
+    which is the HF commit hash. Report "unpinned" if the revision is not pinned."""
     if _loaded_from and _loaded_from != MODEL:
         return os.path.basename(os.path.normpath(_loaded_from))
     return "unpinned"
 
 
 def hang_budget(wav):
-    """这一段音频允许转写多久。读不出时长（文件不存在、不是 wav）就退回 FLOOR：
-    这条路上的请求马上要在 worker 里报错，预算给多少都无所谓。
+    """Return how long this audio may take to transcribe. If the duration cannot
+    be read (missing file, not a wav), return FLOOR: that request fails in the
+    worker at once, so the budget does not matter.
 
-    在父进程里算，不在 worker 里算：算预算的那一方必须是**不会跟着卡死**的那一方。"""
+    Compute it in the parent, not in the worker: the side that computes the
+    budget must be the side that cannot hang."""
     try:
         with wave.open(wav, "rb") as w:
             dur = w.getnframes() / float(w.getframerate() or 16000)
@@ -295,20 +310,22 @@ class FixedPrefixPrefill:
 
 
 def worker_main(pipe):
-    """把 MLX 关在一个可丢弃的子进程里。
+    """Keep MLX in a disposable child process.
 
-    这是整个文件最重要的一个决定。一次 Metal 调用可以挂住而不杀死 Python，如果推理跑在
-    socket 进程里，就只剩两种烂选择：要么 launchd 看到一个健康的 PID 永远不重启它，
-    要么靠一根看门狗线程去 os._exit——而那根线程能不能被调度，取决于卡死的 C 调用有没有
-    释放 GIL。**这个前提不该由我们来赌。**
+    This is the most important design decision in this file. A Metal call can
+    hang without killing Python. If inference ran in the socket process, there
+    would be two bad options: launchd sees a healthy PID and never restarts it,
+    or a watchdog thread calls os._exit, and whether that thread gets scheduled
+    depends on whether the hung C call releases the GIL. Do not rely on that.
 
-    父进程从头到尾不 import mlx、不碰 Metal，所以它一定还应答得动：它给这次请求卡一个
-    死线，到点就回一句 ERROR 让客户端立刻退回一次性 CLI（用户照样拿到字），然后自己退出，
-    由 launchd 换一个全新的 worker——进程死亡是唯一能真正丢掉一个坏掉的 Metal 上下文的
-    办法。
+    The parent never imports mlx and never touches Metal, so it can always
+    answer. It sets a deadline for the request. At the deadline it replies ERROR,
+    so the client falls back to the one-shot CLI at once (the user still gets
+    text), and then it exits. launchd starts a fresh worker. Process death is the
+    only way to discard a broken Metal context.
 
-    MLX 的 import 必须写在函数体里：spawn 会把这个文件重新 import 一遍，写在模块顶层就
-    等于父进程也要付一次加载。
+    Import MLX inside the function body: spawn re-imports this file, and a
+    module-level import would make the parent pay the load as well.
     """
     try:
         import mlx.core as mx
@@ -316,7 +333,7 @@ def worker_main(pipe):
         from mlx_qwen3_asr.tokenizer import _TokenizerHolder
 
         target = model_target()
-        # 必须在任何一次 transcribe 之前——包括下面的 warm_up，它也走 transcribe。
+        # Must run before any transcribe call, including warm_up below, which also calls transcribe.
         tokenizer_pinned = pin_tokenizer_dir(target)
         model, _ = q.load_model(target)
         # Keep the weights in physical RAM; without this macOS can page them out
@@ -346,8 +363,9 @@ def worker_main(pipe):
                 return q.transcribe(wav, model=model, context=context,
                                     language="Chinese")
 
-        # 报回**加载它的那个东西**，不是 MODEL：父进程据此告诉外界跑的是哪个 revision，
-        # 以及词表到底钉住了没有（deploy 拿 PONG 里的 tok= 当上线闸门）。
+        # Report what the model was loaded from, not MODEL. The parent uses it to
+        # tell the outside which revision runs and whether the tokenizer is pinned
+        # (the install check uses the tok= field in PONG as a go-live gate).
         pipe.send(("READY", {"model": target, "tokenizer_pinned": tokenizer_pinned}))
     except Exception as exc:
         try:
@@ -367,9 +385,11 @@ def worker_main(pipe):
         try:
             result = transcribe(wav, context)
             reply = " ".join(str(result.text).splitlines()).strip()
-            # 术语偏置偶尔会把输出整个压没：一整行术语表是很强的先验，撞上短句就可能
-            # 什么都不出。空结果对用户等于"这句话白说了"，所以退一步不带 context 再问
-            # 一次——只在本来就要交白卷的那条路上多花一次，值得。
+            # The term bias can suppress the whole output: a full term-list line is
+            # a strong prior and a short utterance may produce nothing. An empty
+            # result means the user spoke for nothing, so ask once more without
+            # the context. This costs one extra run only on a path that would
+            # otherwise return nothing.
             if not reply and context:
                 print("空转写，去掉术语偏置重试一次", flush=True)
                 result = transcribe(wav, "")
@@ -380,11 +400,11 @@ def worker_main(pipe):
 
 
 class WorkerTimeout(RuntimeError):
-    """worker 到点没回话：当成假死处理，父进程随后退出。"""
+    """The worker did not reply by the deadline. Treat it as hung; the parent then exits."""
 
 
 class WorkerUnavailable(RuntimeError):
-    """worker 不在了/起不来：同样要换一个新的。"""
+    """The worker is gone or cannot start. Replace it as well."""
 
 
 class ASRWorker:
@@ -399,7 +419,7 @@ class ASRWorker:
         proc = ctx.Process(target=worker_main, args=(child,),
                            name="zh-voice-asr-worker", daemon=True)
         proc.start()
-        child.close()               # 父进程留着写端会让 recv 永远等不到 EOF
+        child.close()               # if the parent kept this end, recv would never see EOF
         self.pipe, self.proc = parent, proc
         if not parent.poll(WORKER_START_TIMEOUT_SEC):
             self.stop()
@@ -436,7 +456,7 @@ class ASRWorker:
         if kind == "RESULT":
             self.deadline = None
             return payload
-        # worker 自己抓到的转写异常（读不到 wav 之类）：只赔这一次请求，不换 worker。
+        # Transcription error caught by the worker (for example an unreadable wav): fail this request only and keep the worker.
         self.deadline = None
         raise RuntimeError(payload)
 
@@ -453,8 +473,8 @@ class ASRWorker:
             except Exception:
                 pass
         if proc is not None and proc.is_alive():
-            # 卡死的 worker 既不理 STOP 也不理 SIGTERM，所以一定要有 SIGKILL 这一步：
-            # 它才是真正把那个坏掉的 Metal 上下文丢掉的动作。
+            # A hung worker ignores both STOP and SIGTERM, so SIGKILL is required:
+            # it is the step that discards the broken Metal context.
             proc.terminate()
             proc.join(timeout=3)
             if proc.is_alive():
@@ -466,7 +486,8 @@ def handle(conn, worker, health_only=False):
     """Serve one request. Nothing in here may propagate: this runs on the accept
     loop's own thread, so an escaping exception takes the resident server down.
 
-    返回 True = 这个 daemon 已经不可信了，调用方应当退出让 launchd 换新。"""
+    Return True if this daemon is no longer trustworthy. The caller then exits so
+    that launchd starts a new one."""
     restart = False
     try:
         try:
@@ -483,9 +504,12 @@ def handle(conn, worker, health_only=False):
             wav = lines[0].strip()
             context = (lines[1] if len(lines) > 1 else "").strip()
             if wav == "PING":
-                # 健康探针。故意不碰模型：要测的是"accept 循环还转不转 + worker 还在不在"。
-                # 卡死时父进程仍然答得动，但它会在超时那一刻就退出，所以外面看到的是连不上
-                # 而不是假的健康。回复带上模型名，好让 deploy 顺手确认装的是哪一个。
+                # Health probe. It does not touch the model on purpose: it tests
+                # whether the accept loop runs and the worker is alive. During a
+                # hang the parent can still answer, but it exits at the timeout,
+                # so the outside sees a refused connection and not a false healthy
+                # state. The reply carries the model name so the install check can
+                # confirm which model runs.
                 if not worker.alive():
                     raise WorkerUnavailable("模型 worker 不在跑")
                 deadline = worker.deadline
@@ -501,21 +525,25 @@ def handle(conn, worker, health_only=False):
             else:
                 started = time.monotonic()
                 reply = worker.transcribe(wav, context)
-                # 自报耗时（只在转写回复上加，PING/ERROR 保持原样）：客户端原来用两次
-                # perl 取时间，量到的还掺着 nc 和 socket。转写本身保证单行，所以加一行
-                # 头信息之后"最后一行仍是转写"这个契约不变。
+                # Report the transcription time (only on transcription replies; PING
+                # and ERROR stay unchanged). Client-side timing would include nc and
+                # the socket. The transcript is guaranteed to be one line, so after
+                # the header line the contract "the last line is the transcript"
+                # still holds.
                 elapsed_ms = int((time.monotonic() - started) * 1000)
                 reply = "META asr_ms=%d\n%s" % (elapsed_ms, reply)
         except (WorkerTimeout, WorkerUnavailable) as exc:
-            # 先把 ERROR 回给客户端再退出：zh-voice 见到 ERROR 会立刻退回一次性 CLI，
-            # 用户这句话还是能出字。直接死掉的话它得白等满 nc 的 90s 超时。
+            # Send ERROR to the client before exiting. zh-voice falls back to the
+            # one-shot CLI at once on ERROR, so the user still gets text. If the
+            # daemon just died, the client would wait for the full nc timeout.
             reply = f"ERROR: daemon 不健康：{exc}；正在重启"
             restart = True
             print(reply, flush=True)
         except Exception as exc:           # one bad request must not kill the server
             reply = f"ERROR: {type(exc).__name__}: {exc}"
-        # 回写也要罩在 try 里：客户端读之前就挂断（Ctrl-C、超时）会让 sendall 抛
-        # BrokenPipeError，那是一路冒到 main() 把常驻模型带走的
+        # The reply write also needs the try. If the client hangs up before it
+        # reads (Ctrl-C, timeout), sendall raises BrokenPipeError, which would
+        # propagate to main() and take the resident model down.
         conn.sendall((reply + "\n").encode("utf-8"))
     except Exception:
         pass
@@ -531,7 +559,7 @@ def cleanup():
     """A stale socket file makes the client think the daemon is alive and cost it
     a failed connect before falling back."""
     global _worker, _server, _health_server
-    # 先取出再置空：cleanup 会被 atexit 和 idle 看门狗各调一次，必须可重入。
+    # Take the object out first, then clear the global: atexit and the idle watchdog each call cleanup, so it must be re-entrant.
     worker, _worker = _worker, None
     if worker is not None:
         worker.stop()
@@ -556,16 +584,18 @@ def cleanup():
 
 def main():
     cache_dir = os.path.dirname(SOCK_PATH)
-    # 700/600：socket 和锁只该当前用户碰得到。以前 socket 落地是 srwxr-xr-x，同机任何
-    # 账号都能往里发请求、读回转写内容——单用户 Mac 上是小事，但收紧不花钱。
+    # Modes 700/600: only the current user may reach the socket and the lock. A
+    # socket with mode srwxr-xr-x would let any account on the machine send
+    # requests and read transcripts. Restricting it costs nothing.
     os.makedirs(cache_dir, mode=0o700, exist_ok=True)
     os.chmod(cache_dir, 0o700)
 
     # Single-instance lock, taken BEFORE touching the socket file. Two spawners
-    # exist (launchd KeepAlive and Hammerspoon's health-guarded warmDaemon) and
-    # check-then-spawn is a TOCTOU race: the loser used to unlink the winner's
-    # live socket in cleanup() below, leaving a 3.4 GB zombie serving nothing.
-    # With the lock the loser exits here without having touched anything.
+    # can start a daemon (launchd KeepAlive and the zh-voice CLI fallback), and
+    # check-then-spawn is a TOCTOU race: without the lock, the loser would unlink
+    # the live socket of the winner in cleanup() below and leave a 3.4 GB zombie
+    # that serves nothing. With the lock, the loser exits here without touching
+    # anything.
     global _lock_fd                     # keep the fd alive; close would drop the lock
     _lock_fd = open(SOCK_PATH + ".lock", "w")
     os.chmod(SOCK_PATH + ".lock", 0o600)
@@ -577,17 +607,18 @@ def main():
 
     cleanup()
     atexit.register(cleanup)
-    # 必须忽略 SIGHUP：给它装处理器会抵消 nohup，拉起它的那个 shell 一退出 daemon 就跟着死
+    # Ignore SIGHUP. A handler would cancel nohup, and the daemon would die when the shell that started it exits.
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, lambda *_: sys.exit(0))
     try:
-        os.setsid()          # 脱离父会话，终端关闭/任务结束都不再波及
+        os.setsid()          # detach from the parent session: closing the terminal or ending the task no longer affects the daemon
     except OSError:
         pass
 
-    # 钉死的路径填了却用不上，是**静默**的版本漂移：照样出字，只是出的是另一份权重的字。
-    # 说出来，别让它只能靠 PONG 的 rev= 被事后发现。
+    # A pinned path that is set but unusable is a silent version drift: the daemon
+    # still transcribes, but with other weights. Log it, so that it is not found
+    # only through the rev= field in PONG.
     if MODEL_PATH and model_target() != MODEL_PATH:
         print(f"⚠️  ZH_VOICE_MODEL_PATH={MODEL_PATH} 里没有 config.json，"
               f"退回 repo id {MODEL}（版本由 refs/main 决定，没有钉住）", flush=True)
@@ -602,12 +633,14 @@ def main():
     _loaded_from = ready["model"]
     _tokenizer_pinned = bool(ready["tokenizer_pinned"])
     if not _tokenizer_pinned:
-        # 不是致命的：这条路一直是这么跑的，而且 deploy 在钉不住时会退回去要求那个上游
-        # 仓库存在、且词表和我们钉的逐字节一致。但要说出来，别让它无声无息。
+        # Not fatal: when the pin is not possible, the install check requires the
+        # upstream repo to exist with a tokenizer that is byte-identical to the
+        # pinned one. Log it anyway, so that it is not silent.
         print("⚠️  词表没能钉到 snapshot，仍然来自上游 DEFAULT_MODEL_ID 那个仓库", flush=True)
 
-    # socket 在 worker READY 之后才 bind：所以"socket 出现"这件事本身就等价于"权重已经
-    # 进了内存"，deploy 和客户端都可以依赖这个顺序。
+    # Bind the socket only after the worker is READY. So "the socket exists"
+    # means "the weights are in memory", and the install check and the clients
+    # can rely on this order.
     old_umask = os.umask(0o077)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -638,9 +671,10 @@ def main():
     threading.Thread(target=health_loop, daemon=True).start()
     print(f"ready: {_loaded_from} tokenizer_pinned={_tokenizer_pinned}", flush=True)
 
-    # ZH_VOICE_IDLE <= 0 = 常驻模式：launchd 托管时就是这么用的。让模型一直待在内存里，
-    # 代价是 ~3.4 GB 常驻，换掉的是"按下热键那一刻才冷启动"——2026-07-27 那次就是
-    # 唤醒后 34 秒按键，录音和 3.4 GB 冷加载撞在同一秒，把 Hammerspoon 整个拖死。
+    # ZH_VOICE_IDLE <= 0 means resident mode, which launchd uses. The model stays
+    # in memory. The cost is ~3.4 GB resident. The gain is that the model never
+    # cold-starts at the moment of a hotkey press, where recording and the 3.4 GB
+    # cold load would compete for the same second.
     if IDLE_SEC > 0:
         threading.Thread(target=watchdog, daemon=True).start()
     else:

@@ -40,6 +40,6 @@ if "--json" in argv:
         "trim_end_ms": 1280 if speech else 1500,
         "trimmed": speech,
         "segments": [{"start_ms": 460, "end_ms": 1120}] if speech else [],
-    }, sort_keys=True, separators=(",", ":")))   # 紧凑，和 Swift JSONEncoder 同形
+    }, sort_keys=True, separators=(",", ":")))   # compact, same shape as Swift JSONEncoder output
 
 raise SystemExit(0 if speech else 3)

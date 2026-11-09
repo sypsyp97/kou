@@ -4,34 +4,35 @@
 #
 # Usage:  zh-voice            # record, then transcribe
 #         zh-voice clip.wav   # transcribe an existing file (no mic)
-#         zh-voice --from-recorder clip.wav   # 同上，但调用方保证 16k/mono（见下）
+#         zh-voice --from-recorder clip.wav   # same, but the caller guarantees 16 kHz mono (see below)
 #         zh-voice --health   # is the resident daemon actually serving?
-#         zh-voice --doctor   # 逐项体检：依赖、模型缓存、daemon
+#         zh-voice --doctor   # check each item: dependencies, model cache, daemon
 #
 # Env:  ZH_VOICE_MODEL   Qwen3-ASR model id (0.6B is ~2x faster, noticeably worse
 #                        on English jargon: sbatch->batch, GR00T->GR零零G)
-#       ZH_VOICE_ASR_REVISION / _MODEL_PATH  钉死加载哪个 HF snapshot，见下面
-#                        find_model_arg —— 光给 repo id 是钉不住版本的
+#       ZH_VOICE_ASR_REVISION / _MODEL_PATH  pin the HF snapshot to load (see
+#                        find_model_arg below; a repo id alone does not pin a version)
 #       ZH_VOICE_TERMS   term-bias file (default ~/.config/zh-voice/terms.txt)
-#       ZH_VOICE_CONTEXT_PREFIX  术语表的前缀，默认 "Technical terms:"。只有它和
-#                        "Vocabulary:"/"Proper nouns:" 实测有效，见下面 CONTEXT 那段
+#       ZH_VOICE_CONTEXT_PREFIX  prefix of the term list, default "Technical terms:".
+#                        Only this and "Vocabulary:"/"Proper nouns:" worked in
+#                        measurements (see the CONTEXT section below)
 #       ZH_VOICE_MAX_SEC recording cap, default 60
 #       ZH_VOICE_HANG    silence seconds that end a recording, default 2.0
-#       ZH_VOICE_DAEMON_WAIT      socket reply deadline, default 195s（要 > daemon 的
-#                        HANG_CEIL，理由见下面 DAEMON_WAIT 那段）
+#       ZH_VOICE_DAEMON_WAIT      socket reply deadline, default 195s (must be
+#                        longer than the daemon HANG_CEIL; see DAEMON_WAIT below)
 #       ZH_VOICE_VAD_ENABLED      set to 0 to bypass the local VAD, default 1
-#       ZH_VOICE_VAD_THRESHOLD / _OFFSET  Silero 起停阈值，默认 0.5 / 0.35
+#       ZH_VOICE_VAD_THRESHOLD / _OFFSET  Silero start/stop thresholds, default 0.5 / 0.35
 #       ZH_VOICE_VAD_MIN_SPEECH_MS  minimum speech span, default 250 ms
-#       ZH_VOICE_CORPUS_FLAG / _DIR  本地语料存档：开关文件（默认 ~/.config/zh-voice/corpus，
-#                        存在才存）与存放目录（默认 ~/.local/share/zh-voice/corpus）
+#       ZH_VOICE_CORPUS_FLAG / _DIR  local corpus archive: flag file (default
+#                        ~/.config/zh-voice/corpus; archive only if it exists) and
+#                        target directory (default ~/.local/share/zh-voice/corpus)
 set -euo pipefail
 
 # Everything at runtime is local; the models are provisioned at install time.
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
-# GUI-launched processes inherit launchd's minimal PATH. Hammerspoon currently
-# passes a full one through, but that is a property of how it was started, not
-# a guarantee — and losing soxi/opencc here degrades silently. Append rather
-# than prepend so the caller (and the test suite's stub bin) still wins.
+# GUI-launched processes inherit the minimal launchd PATH. A missing soxi or
+# opencc degrades silently. Append the Homebrew paths instead of prepending
+# them, so the caller (and the test suite's stub bin) still wins.
 export PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}:/opt/homebrew/bin:$HOME/.local/bin"
 
 MODEL="${ZH_VOICE_MODEL:-mlx-community/Qwen3-ASR-1.7B-8bit}"
@@ -39,28 +40,34 @@ MAX_SEC="${ZH_VOICE_MAX_SEC:-60}"
 HANG="${ZH_VOICE_HANG:-2.0}"
 TERMS_FILE="${ZH_VOICE_TERMS:-$HOME/.config/zh-voice/terms.txt}"
 SOCK="${ZH_VOICE_SOCKET:-$HOME/.cache/zh-voice/asr.sock}"
-# 必须 **大于** daemon 的 HANG_CEIL（zh-voice-daemon 里是 180s）。客户端先放弃的话，
-# daemon 还在正常算长句，这边已经退回一次性 CLI 去加载第二份 3.4 GB 模型了——两份权重
-# 同时占内存正是 daemon 那条 CEIL 注释要避免的事。daemon 先放弃则是设计内的路径：
-# 它回一句 ERROR，客户端立刻兜底，launchd 换一个干净的。
-# 改这里或改 daemon 的 CEIL 都要保持这个大小关系，test_daemon_wait_outlives_worker_ceiling 看着。
+# Must be LONGER than the daemon HANG_CEIL (180s in zh-voice-daemon). If the
+# client gave up first, the daemon would still be decoding a long utterance
+# while the client falls back to the one-shot CLI and loads a second 3.4 GB
+# model. Two copies of the weights in memory is what the daemon CEIL comment
+# prevents. If the daemon gives up first, that is the designed path: it
+# replies ERROR, the client falls back at once, and launchd starts a clean
+# daemon.
+# Keep this size relation when you change this value or the daemon CEIL.
+# test_daemon_wait_outlives_worker_ceiling checks it.
 DAEMON_WAIT="${ZH_VOICE_DAEMON_WAIT:-195}"
-# ASR 的 snapshot 和 VAD 一样要钉死，而且更贵。`--model <repo id>` 是**钉不住版本的**：
-# 离线模式下 huggingface_hub 去读 refs/main，那是"缓存里最近一次拉到的那一版"，不是我们
-# 钉的那一版；上游更新过一次，两者就分开了，而症状只是"转写忽然变差"。
-# daemon 那边靠 plist 里的 ZH_VOICE_MODEL_PATH，这里管的是 CLI 兜底这一条路。
-# 和 deploy.sh 的 ASR_REVISION 必须是同一个值（test_zh_voice 里有断言盯着两边一致）。
+# Pin the ASR snapshot, as for the VAD. `--model <repo id>` does NOT pin a
+# version: in offline mode huggingface_hub reads refs/main, which is the most
+# recently fetched snapshot in the cache. After an upstream update it differs
+# from the pinned one, and the only symptom is worse transcription.
+# The daemon uses ZH_VOICE_MODEL_PATH from its plist. This pin covers the CLI
+# fallback path.
 ASR_REVISION="${ZH_VOICE_ASR_REVISION:-a8379a2e2f9e313c9292cdf1af4055ab56d50d55}"
 MODEL_SNAPSHOTS="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--${MODEL//\//--}/snapshots"
 VAD_MODEL="${ZH_VOICE_VAD_MODEL:-aufklarer/Silero-VAD-v6.2.1-CoreML}"
-# 和 deploy.sh 的 VAD_REVISION 必须是同一个值（test_zh_voice 里有一条断言盯着）。
+# Pinned Silero VAD snapshot revision.
 VAD_REVISION="${ZH_VOICE_VAD_REVISION:-523876545a57961474fee9df913e833e130560b8}"
 VAD_BIN="${ZH_VOICE_VAD_BIN:-zh-voice-audio}"
 VAD_CACHE_ROOT="${HF_HOME:-$HOME/.cache/huggingface}/hub/models--${VAD_MODEL//\//--}/snapshots"
 
-# 交给 `mlx-qwen3-asr --model` 的东西：钉死的 snapshot 目录优先（它认本地路径，形参就叫
-# path_or_hf_repo），拿不到才退回 repo id。退回是故意的——宁可版本没钉住也要出字；真正
-# 该拦住漂移的是 deploy 的预检（那里是 die）和 --doctor。
+# Value for `mlx-qwen3-asr --model`. Prefer the pinned snapshot directory (the
+# parameter is path_or_hf_repo and accepts a local path). Fall back to the repo
+# id only if the snapshot is missing. The fallback is deliberate: an unpinned
+# version is better than no transcription. --doctor reports version drift.
 find_model_arg() {
   if [ -n "${ZH_VOICE_MODEL_PATH:-}" ] && [ -f "$ZH_VOICE_MODEL_PATH/config.json" ]; then
     printf '%s\n' "$ZH_VOICE_MODEL_PATH"
@@ -73,23 +80,24 @@ find_model_arg() {
   printf '%s\n' "$MODEL"
 }
 
-# 显式路径优先（测试和排查都靠它），否则去 HF 缓存里找那个编译好的 .mlmodelc 目录。
-# 找不到一律返回空字符串而不是报错：调用方据此走 fail-open。
+# An explicit path wins (tests and debugging use it). Otherwise look in the HF
+# cache for the compiled .mlmodelc directory. If nothing is found, return an
+# empty string instead of an error: the caller then fails open.
 find_vad_model() {
   if [ -n "${ZH_VOICE_VAD_MODEL_PATH:-}" ]; then
     [ -d "$ZH_VOICE_VAD_MODEL_PATH" ] && printf '%s\n' "$ZH_VOICE_VAD_MODEL_PATH"
     return 0
   fi
   [ -d "$VAD_CACHE_ROOT" ] || return 0
-  # 优先用钉死的 revision（和 deploy.sh 的 VAD_REVISION 是同一个值，测试盯着两边一致）。
-  # 缓存里同时存在多个版本时，原来的 `-print -quit` 是按目录顺序碰运气。
+  # Prefer the pinned revision. With several versions in the cache,
+  # `-print -quit` would pick one by directory order.
   if [ -n "${VAD_REVISION:-}" ] \
      && [ -d "$VAD_CACHE_ROOT/$VAD_REVISION/silero_vad.mlmodelc" ]; then
     printf '%s\n' "$VAD_CACHE_ROOT/$VAD_REVISION/silero_vad.mlmodelc"
     return 0
   fi
-  # 退回"找一个"：运行期宁可用个别的版本也别让整条链路停摆——真正该拦住版本漂移的
-  # 是 deploy 的预检，那里是 die，不是 fallback。
+  # Fall back to any cached version: at run time a different version is better
+  # than a stopped pipeline.
   find "$VAD_CACHE_ROOT" -mindepth 2 -maxdepth 2 -type d \
     -name silero_vad.mlmodelc -print -quit 2>/dev/null || true
 }
@@ -99,14 +107,15 @@ find_vad_model() {
 if [ "${1:-}" = "--health" ]; then
   [ ! -S "$SOCK.health" ] || SOCK="$SOCK.health"
   if [ ! -S "$SOCK" ]; then
-    # ${} 不能省：$SOCK 紧跟全角「）」时 bash 会把那个多字节字符的头一个字节也算进变量名，
-    # set -u 下当场变成 "SOCK\xef: unbound variable"。
+    # Keep the braces: when $SOCK is followed by a full-width parenthesis, bash
+    # counts the first byte of that multibyte character as part of the variable
+    # name, and set -u fails with "SOCK\xef: unbound variable".
     echo "unhealthy: 没有 socket，daemon 没在跑（${SOCK}）" >&2
     exit 1
   fi
   PONG="$(printf 'PING\n\n' | nc -w "${ZH_VOICE_HEALTH_TIMEOUT:-10}" -U "$SOCK" 2>/dev/null | tail -1 || true)"
-  # 前缀匹配而不是全等：回复是 "PONG <模型名>"，那个模型名值得回显出来——它能分辨
-  # "daemon 活着"和"daemon 活着而且跑的是我刚装的那一版"。
+  # Match the prefix, not the whole reply. The reply is "PONG <model name>".
+  # Echoing the model name shows which model the live daemon runs.
   case "$PONG" in
     PONG*)
       echo "healthy: ${PONG}"
@@ -117,8 +126,9 @@ if [ "${1:-}" = "--health" ]; then
   exit 1
 fi
 
-# 体检：出问题时第一件事就该是跑这个，而不是逐项猜。分必需和可选两档——opencc 丢了只是
-# 繁简不转（脚本会降级），soxi/ffmpeg/nc 丢了是整条链路断掉。
+# Health check: run this first when something fails. Dependencies have two
+# tiers. A missing opencc only disables Traditional-to-Simplified conversion
+# (the script degrades). A missing soxi, ffmpeg or nc breaks the whole pipeline.
 if [ "${1:-}" = "--doctor" ]; then
   FAILED=0
   for CMD in soxi ffmpeg nc mlx-qwen3-asr "$VAD_BIN"; do
@@ -135,8 +145,8 @@ if [ "${1:-}" = "--doctor" ]; then
     printf 'warn  %-14s 不在 PATH 上（只影响繁简转换，不影响出字）\n' "opencc"
   fi
 
-  # 查的是**钉死的那个 snapshot**，不是"缓存里有没有东西"。后者会把"上游更新过、我们钉的
-  # 那一版已经被清掉了"报成 ok，而那正是要在这里发现的情况。
+  # Check the PINNED snapshot, not "anything in the cache". The latter reports
+  # ok when the pinned version was purged after an upstream update.
   if [ -f "$MODEL_SNAPSHOTS/$ASR_REVISION/config.json" ]; then
     printf 'ok    %-14s %s @ %s\n' "model" "$MODEL" "${ASR_REVISION:0:12}…"
   else
@@ -145,11 +155,14 @@ if [ "${1:-}" = "--doctor" ]; then
     FAILED=1
   fi
 
-  # 词表：daemon 会把它钉到自己加载的那个 snapshot（见 zh-voice-daemon 的 pin_tokenizer_dir），
-  # 钉住之后上游 DEFAULT_MODEL_ID 那个仓库就**不再需要** —— 实测 HF 缓存全空也照样出字。
-  # 钉子的前提是那个 snapshot 自带词表文件，所以先查这个；查不到才回头要求上游那份缓存，
-  # 因为那时词表确实来自它，而它被清掉的症状是每次转写回 ERROR 而别处全绿。
-  # 线上究竟钉住没有，看下面 daemon 那一行 PONG 里的 tok=。
+  # Tokenizer: the daemon pins it to the snapshot it loads (see pin_tokenizer_dir
+  # in zh-voice-daemon). With the pin, the upstream DEFAULT_MODEL_ID repo is not
+  # needed: transcription works even with an empty HF cache.
+  # The pin requires that the snapshot contains the tokenizer files, so check
+  # that first. Only if it does not, require the upstream cache, because then the
+  # tokenizer comes from it. If that cache is missing, every transcription
+  # replies ERROR while every other check stays green.
+  # The tok= field in the daemon PONG line below shows whether the pin is active.
   MODEL_TOK_DIR="$MODEL_SNAPSHOTS/$ASR_REVISION"
   if [ -f "$MODEL_TOK_DIR/vocab.json" ] && [ -f "$MODEL_TOK_DIR/merges.txt" ] \
      && [ -f "$MODEL_TOK_DIR/tokenizer_config.json" ]; then
@@ -167,7 +180,8 @@ if [ "${1:-}" = "--doctor" ]; then
     fi
   fi
 
-  # VAD 缺了不会让听写失效（fail-open），但会让术语表泄漏那个洞重新打开，所以算 FAIL。
+  # A missing VAD does not stop dictation (fail-open), but it reopens the
+  # term-list leak (see the voice gate below), so it counts as FAIL.
   if [ -n "$(find_vad_model)" ]; then
     printf 'ok    %-14s %s\n' "vad model" "$VAD_MODEL"
   else
@@ -184,15 +198,17 @@ if [ "${1:-}" = "--doctor" ]; then
   exit "$FAILED"
 fi
 
-# ── 运行指标：只记数字，不记内容 ────────────────────────────────────────────
-# "没听清"有好几种完全不同的成因——VAD 把它当静音拦了、ASR 返回空、daemon 刚被换掉走了
-# CLI 兜底、术语回声被丢弃。事后从界面上看全都长一个样。这里留一行数字就能分清。
-# **刻意不记音频路径和转写文本**：那正是这一轮在从磁盘上清掉的东西，没道理又抄进日志。
+# ── Run metrics: numbers only, never content ───────────────────────────────
+# "Not heard" has several different causes: the VAD gated it as silence, the
+# ASR returned empty, the daemon was replaced and the CLI fallback ran, or a
+# term-list echo was dropped. The UI shows all of them the same way. One line
+# of numbers tells them apart.
+# Do NOT log audio paths or transcript text.
 METRICS="${ZH_VOICE_METRICS:-$HOME/.cache/zh-voice/metrics.log}"
 METRICS_MAX=$((256 * 1024))
 metric() {
   [ "${ZH_VOICE_METRICS_ENABLED:-1}" = "0" ] && return 0
-  # mkdir 只在目录真不在时才花一次 spawn（[ -d ] 是内建）：这个函数每轮都跑。
+  # mkdir spawns only if the directory is missing ([ -d ] is a builtin). This function runs every turn.
   [ -d "${METRICS%/*}" ] || mkdir -p "${METRICS%/*}" 2>/dev/null || return 0
   if [ -f "$METRICS" ]; then
     _sz="$(stat -f%z "$METRICS" 2>/dev/null || echo 0)"
@@ -202,9 +218,10 @@ metric() {
   return 0
 }
 
-# 从 VAD 那行 JSON 里抠一个字段。字段都是数字或 true/false，单行输出，用不着 python。
-# 冒号后的空格要容忍：Swift 的 JSONEncoder 输出是紧凑的，但换个编码器就未必
-# （测试 stub 用 python 的 json.dumps 就带空格，第一版正是栽在这上面）。
+# Extract one field from the VAD JSON line. Fields are numbers or true/false in
+# single-line output, so python is not needed. Allow spaces after the colon:
+# Swift JSONEncoder output is compact, but other encoders are not (the test
+# stub uses Python json.dumps, which adds spaces).
 json_num() {
   [ -f "${2:-}" ] || return 0
   local _json _pattern
@@ -221,9 +238,10 @@ json_num() {
 M_VAD_P=""; M_VAD_SPEECH=""; M_AUDIO_IN=""; M_AUDIO_OUT=""
 M_STRONG=""; M_VAD_DEGRADED=0; M_PATH="none"; M_RETRY=0
 
-# 热键路径的 wav 是我们自己的录音器写的，格式恒定 16k/mono/16-bit，时长也由下面的
-# VAD 顺手报回来 —— 所以 `--from-recorder` 一来就免掉三次 soxi（-r/-c/-D，实测 6.4ms 一次）。
-# 独立入口（人手给一个任意 wav）没有这个保证，照旧探格式、照旧查时长。
+# The hotkey path writes the wav with our own recorder: always 16 kHz, mono,
+# 16-bit. The VAD below also reports the duration. So `--from-recorder` skips
+# three soxi calls (-r/-c/-D, 6.4 ms each). The standalone entry (any wav from
+# the user) has no such guarantee, so it still probes format and duration.
 FROM_RECORDER=0
 if [ "${1:-}" = "--from-recorder" ]; then FROM_RECORDER=1; shift; fi
 
@@ -239,11 +257,11 @@ if [ $# -ge 1 ]; then
     ffmpeg -y -loglevel error -i "$1" -ar 16000 -ac 1 -c:a pcm_s16le "$WORK/in.wav"
   fi
 else
-  FROM_RECORDER=1                    # 下面这一行录出来的，同样是 16k/mono
+  FROM_RECORDER=1                    # the recording below is also 16 kHz mono
   echo "🎙  请说话（停顿 ${HANG}s 自动结束，最长 ${MAX_SEC}s）…" >&2
-  # 原生录音器代替 sox 的 rec：拿得到 Apple 的语音处理（回声消除/AGC），
-  # 而且它自己就写 16k mono 16-bit，不用再靠 sox 的重采样。
-  # `--auto-stop-silence` 顶替原来 sox 的 `silence` 效果。
+  # The native recorder gives Apple voice processing (echo cancellation, AGC)
+  # and writes 16 kHz mono 16-bit directly, so no resampling is needed.
+  # `--auto-stop-silence` stops the recording after the silence hang time.
   "$VAD_BIN" record "$WORK/in.wav" \
       --max-seconds "$MAX_SEC" --auto-stop-silence "$HANG" 2>/dev/null || true
 fi
@@ -252,8 +270,9 @@ if [ ! -s "$WORK/in.wav" ]; then
   echo "没有录到声音（文件是空的）。若是第一次运行，去 系统设置 → 隐私与安全性 → 麦克风 打开终端(Ghostty)的权限。" >&2
   exit 1
 fi
-# 时长下限只归独立入口：热键那条路 init.lua 已经用 MIN_BYTES 判过"按得太短"，
-# 在这里再判一次就是为同一件事多花一次 soxi。
+# The minimum-duration check applies to the standalone entry only. The caller
+# of the hotkey path already rejects recordings that are too short, so a second
+# check here would cost one more soxi call.
 if [ "$FROM_RECORDER" = 0 ]; then
   DUR="$(soxi -D "$WORK/in.wav" 2>/dev/null || echo 0)"
   if awk -v d="$DUR" 'BEGIN{exit !(d < 0.4)}'; then
@@ -262,23 +281,27 @@ if [ "$FROM_RECORDER" = 0 ]; then
   fi
 fi
 
-# ── 语音闸门 ────────────────────────────────────────────────────────────────
-# 没人说话时，带术语表的 ASR 会把**整份术语表当成转写结果吐出来**，然后被自动粘贴到
-# 当前 app。实测（本机，线上 terms.txt 那 506 字符 context）：纯底噪 / 风扇嗡嗡 / 白噪声
-# 三类都输出 "技术术语：具身智能, LIBERO, LIBERO-Pro, …" 整串；不带 context 时是「嗯。」。
-# 原有的四道防线全部拦不住（MIN_BYTES 只挡 <0.25s，DUR<0.4 同理，daemon 的空结果重试
-# 不触发因为输出非空，init.lua 只判非空）。
+# ── Voice gate ──────────────────────────────────────────────────────────────
+# With no speech, an ASR given a term list can output the WHOLE term list as
+# the transcript, and the caller pastes it into the active app. Measured with
+# the production 506-character context: pure noise, fan hum and white noise
+# all produced the full string "技术术语：具身智能, LIBERO, LIBERO-Pro, …".
+# Without a context the output is "嗯。". The size checks (MIN_BYTES, DUR < 0.4)
+# and the daemon empty-result retry do not stop this: the output is non-empty.
 #
-# 闸门放在这里而不是 daemon 里：socket 和 CLI 两条路都要过，且 CONTEXT 就是在下面拼的。
-# 判定为静音时 **exit 0 且不输出任何东西** —— init.lua 对「退出码 0 + 空输出 + 空 stderr」
-# 已经有分支，显示「没听清，再说一次」，一个字都不会粘。
+# The gate is here and not in the daemon because both the socket path and the
+# CLI path must pass it, and CONTEXT is built below.
+# When the VAD finds silence, exit 0 and print nothing. The caller treats
+# "exit code 0, empty output, empty stderr" as "not heard" and pastes nothing.
 #
-# 检测器本身出错时一律 fail-open（照常转写）：部署预检和 --doctor 负责发现装坏了的情况，
-# 运行期宁可多转一次，也不能让一次探测失败吃掉真实语音。
+# If the detector itself fails, fail open (transcribe as usual): at run time an
+# extra transcription is better than losing real speech to a failed probe.
+# --doctor reports a broken install.
 #
-# `--trim` 让它顺手把首尾静音裁掉（原地重写 in.wav，写临时文件再原子替换）。
-# 这不只是省时间：长停顿正是 ASR 产生幻觉的温床。实测一段 27.8s 的录音（前 25s 静音）
-# 裁到 1.6s，而 VAD 自己扫完全程只要 0.11s——扫描的代价可以忽略，省下的是 ASR 的钱。
+# `--trim` also cuts leading and trailing silence. It rewrites in.wav in place
+# (write a temporary file, then replace atomically). This saves time, and long
+# pauses also cause ASR hallucination. Example: a 27.8 s recording (first 25 s
+# silent) is trimmed to 1.6 s. The VAD scans the whole file in 0.11 s.
 if [ "${ZH_VOICE_VAD_ENABLED:-1}" != "0" ]; then
   VAD_MODEL_PATH="$(find_vad_model)"
   if command -v "$VAD_BIN" >/dev/null 2>&1 && [ -n "$VAD_MODEL_PATH" ]; then
@@ -314,26 +337,29 @@ fi
 # Domain terms keep English jargon (LIBERO, sbatch, mLSTM …) from being decoded as
 # Chinese homophones (eval->Apple, sbatch->Spatch were the observed failures).
 #
-# 措辞不是风格问题，是效果问题。一组 184 次转写、跑在**同一个模型**
-# （mlx-community/Qwen3-ASR-1.7B-8bit）上的实测：
+# The wording of the context changes the result. Measured: 184 transcriptions
+# with the same model (mlx-community/Qwen3-ASR-1.7B-8bit):
 #
-#   格式                          4 段音频均值 WER   召回   术语泄漏
-#   完全不给 context                    35.2%        57%     0/4
-#   空格拼成一串（这里原来的做法）      33.8%        65%     1/4
-#   Technical terms: a, b, c.           18.2%        79%     0/4
+#   format                        mean WER (4 clips)  recall  term leak
+#   no context                          35.2%          57%     0/4
+#   terms joined by spaces              33.8%          65%     1/4
+#   Technical terms: a, b, c.           18.2%          79%     0/4
 #
-# 最难那段更极端：空格拼串 87.5%，比**不给 context**（78.1%）还差，而包起来是 28.1%。
-# 也就是说原来这行不只是没帮上忙，它在难音频上是**负收益**，还会把没说过的术语漏进结果。
+# On the hardest clip the difference is larger: space-joined 87.5%, worse than
+# no context (78.1%), against 28.1% with the wrapped form. On hard audio the
+# space-joined list hurts, and it leaks terms that nobody said.
 #
-# 前缀不能随便换：同一组实验里八个替代前缀（Terms:／Keywords:／Glossary:／Context:／
-# Technical:／Technical vocabulary:／Programming terms:／Software terms:）全部退回裸列表
-# 的水平，只有 Technical terms:／Vocabulary:／Proper nouns: 三个过关。所以默认值别动，
-# 想试别的用 ZH_VOICE_CONTEXT_PREFIX，那三个之外的基本等于关掉这个功能。
+# Do not change the prefix. In the same experiment eight other prefixes
+# (Terms:, Keywords:, Glossary:, Context:, Technical:, Technical vocabulary:,
+# Programming terms:, Software terms:) all fell back to the bare-list level.
+# Only Technical terms:, Vocabulary: and Proper nouns: passed. Any other value
+# of ZH_VOICE_CONTEXT_PREFIX effectively disables the feature.
 #
-# 分隔符用逗号、结尾带句号，都照实测的那一版。
+# The separator is a comma and the list ends with a period, as measured.
 #
-# 切分规则：一行一个词，词里可以有空格（Claude Code、flow matching）；# 之后是注释。
-# 同时去重：terms.txt 里 checkpoint/benchmark 各出现两次，重复的先验只是白占 token。
+# Splitting rule: one term per line. A term may contain spaces (Claude Code,
+# flow matching). Text after # is a comment.
+# Terms are de-duplicated: a repeated term only wastes tokens.
 CONTEXT_PREFIX="${ZH_VOICE_CONTEXT_PREFIX:-Technical terms:}"
 CONTEXT=""
 TERMS=""; WANT=""
@@ -341,8 +367,9 @@ TERMS=""; WANT=""
 # Replace punctuation literally; byte-oriented character classes can split UTF-8.
 # Shell operations avoid process startup for short text. Long glob substitutions
 # scale poorly in the system Bash, so longer text keeps the native pipeline.
-# $2 = ws：空白不删、当成逗号切段。ASR 背术语表时也可能用空格分隔（09-21 实测 663 字那次），
-# 去空白之后整串没有逗号，按逗号切段的判据就全部落空。
+# $2 = ws: keep whitespace and treat it as a comma separator. The ASR can also
+# recite the term list separated by spaces. If whitespace were deleted, the
+# string would contain no commas and every comma-based criterion would miss.
 normalize_echo() {
   if [ "${#1}" -gt 128 ]; then
     if [ "${2:-}" = ws ]; then
@@ -379,12 +406,14 @@ normalize_echo() {
   printf '%s' "$_normalized"
 }
 
-# 术语串（发给 ASR 的 context）和它的归一化形式（给下面回声网当参照）只随 terms.txt 变，
-# 每轮重算却要一次 sed+awk 加三次 spawn（实测 ~15ms）。缓存一份，第一行存 terms.txt 的
-# mtime+大小当 key。
-# ⚠️ 不用更便宜的 `[ $cache -nt $terms ]`（内建、零 spawn）：bash 3.2 只比到**秒**，
-# 于是"同一秒内写完缓存又编辑了 terms.txt"会让新加的词**永远**读不进来——加词不生效
-# 是静默的错，值得为它花一次 stat（3ms）。
+# The term string (the context sent to the ASR) and its normalized form (the
+# reference for the echo checks below) change only with terms.txt. Recomputing
+# them each turn costs one sed+awk and three spawns (~15 ms). Cache them. The
+# first cache line holds the terms.txt mtime and size as the key.
+# Do not use the cheaper `[ $cache -nt $terms ]` (builtin, no spawn): bash 3.2
+# compares only whole seconds. If terms.txt is edited in the same second that
+# the cache is written, the new terms would never load, and that failure is
+# silent. One stat call (3 ms) avoids it.
 TERMS_CACHE="${ZH_VOICE_TERMS_CACHE:-$HOME/.cache/zh-voice/terms.cache}"
 TERMS_KEY=""
 if [ -f "$TERMS_FILE" ]; then
@@ -404,7 +433,8 @@ if [ -f "$TERMS_FILE" ] && [ -z "$TERMS" ]; then
     }
     { emit($0) }')"
   WANT="$(normalize_echo "$TERMS")"
-  # 写缓存失败绝不能影响这一轮：写临时文件再 mv，坏了就当没缓存（下一轮再算一次）。
+  # A cache write failure must not affect this turn. Write a temporary file,
+  # then mv. On failure, behave as if there is no cache (recompute next turn).
   if [ -n "$TERMS" ]; then
     [ -d "${TERMS_CACHE%/*}" ] || mkdir -p "${TERMS_CACHE%/*}" 2>/dev/null || true
     if printf '%s\n%s\n%s\n' "$TERMS_KEY" "$TERMS" "$WANT" >"$TERMS_CACHE.$$" 2>/dev/null; then
@@ -412,8 +442,8 @@ if [ -f "$TERMS_FILE" ] && [ -z "$TERMS" ]; then
     fi
   fi
 fi
-# 只剩注释和空行时 TERMS 是空的：那就一个字都不要发，别发一个空壳
-# "Technical terms: ." —— 那是给模型一个没有内容的先验，纯噪声。
+# If only comments and blank lines remain, TERMS is empty. Send nothing. An
+# empty shell "Technical terms: ." gives the model a prior without content.
 if [ -n "$TERMS" ]; then
   CONTEXT="$CONTEXT_PREFIX $TERMS."
 fi
@@ -421,32 +451,38 @@ fi
 # Prefer the resident daemon (model already in RAM); fall back to the one-shot CLI
 # and start the daemon in the background so the NEXT utterance is the fast path.
 #
-# 转写耗时由 **daemon 自己报**（回复的第一行 `META asr_ms=<n>`）。原来这边用两次
-# perl 取时间（各 5ms，bash 3.2 没有 EPOCHREALTIME），量到的还是 nc + socket + 转写
-# 的总和；服务端那个数字既免费又只算模型。CLI 兜底那条路拿不到，记 `asr_ms=?`。
+# The daemon reports the transcription time itself, in the first reply line
+# `META asr_ms=<n>`. It covers the model only and costs nothing. Timing on the
+# client side would need two perl calls (5 ms each; bash 3.2 has no
+# EPOCHREALTIME) and would include nc and the socket. The CLI fallback has no
+# such number and records `asr_ms=?`.
 #
-# 转写一次。$1 = 用哪份 context（空串 = 不带术语偏置，给回声重试用）。
-# 抽成函数是为了让"疑似术语回声就不带 context 再来一次"能复用同一条链路，
-# 而不是把 socket/CLI 那套兜底逻辑再抄一遍。
+# Transcribe once. $1 = the context to use (empty string = no term bias, used
+# by the echo retry). A function lets the retry for a suspected term-list echo
+# reuse the same socket/CLI fallback chain.
 #
-# 结果走全局 TRANSCRIBE_OUT，**不是** stdout —— 因为 `$(transcribe …)` 会开子 shell，
-# 函数里给 M_PATH 的赋值就传不回来了，指标永远是 path=none（测试抓到过）。
+# The result goes to the global TRANSCRIBE_OUT, NOT to stdout. `$(transcribe …)`
+# would run in a subshell and the M_PATH assignment would be lost.
 transcribe() {
   _ctx="$1"; _out=""; _ms=""
   if [ -S "$SOCK" ]; then
-    # `|| true`：daemon 没应答时 pipefail 会让 set -e 静默杀掉整个脚本，走不到兜底
-    # `-w $DAEMON_WAIT`：daemon 卡死（MLX 偶发）时 nc 会永远等下去，上层就是"转圈不回来"。
-    # 这个值必须**大于** daemon 自己的 HANG_CEIL(180s 那条封顶)之下的实际预算，否则客户端
-    # 先放弃、去起第二份 3.4 GB 模型，而 daemon 那边还在正常算——原来写死的 90s 就是这样。
+    # `|| true`: without a daemon reply, pipefail makes set -e kill the script
+    # silently before the fallback runs.
+    # `-w $DAEMON_WAIT`: if the daemon hangs (rare MLX stall), nc would wait
+    # forever. The value must be longer than the daemon HANG_CEIL budget (180 s
+    # cap). Otherwise the client gives up first and starts a second 3.4 GB model
+    # while the daemon is still decoding.
     # A sentinel preserves the empty payload line through command substitution.
     _raw="$(printf '%s\n%s\n' "$WORK/in.wav" "$_ctx" | nc -w "$DAEMON_WAIT" -U "$SOCK" 2>/dev/null || true
       printf '\001')"
     _raw="${_raw%$'\001'}"
     _raw="${_raw%$'\n'}"
-    # 回复是 `META asr_ms=<n>\n<转写>`，转写本身 daemon 保证是单行（它 join 掉换行）。
-    # 用参数展开切最后一行，省掉一次 tail；没有 META 的回复（老 daemon、PING、ERROR）
-    # 整串就是最后一行，行为不变。判 META 要求后面真有换行，否则一句以 "META asr_ms="
-    # 开头的转写会被当成头信息。
+    # The reply is `META asr_ms=<n>\n<transcript>`. The daemon guarantees a
+    # single-line transcript (it joins newlines). Parameter expansion takes the
+    # last line and saves one tail call. A reply without META (old daemon, PING,
+    # ERROR) is one line, and the behavior stays the same. The META check
+    # requires a real newline after it. Otherwise a transcript that starts with
+    # "META asr_ms=" would be taken as a header.
     _out="${_raw##*$'\n'}"
     case "$_raw" in
       "META asr_ms="*$'\n'*)
@@ -480,9 +516,10 @@ transcribe() {
       return 75
     fi
     if pgrep -f zh-voice-daemon >/dev/null 2>&1; then :; else
-      rm -f "$SOCK"                                # 死掉的 daemon 留下的空壳
-      # 日志写 $TMPDIR：/tmp 是全机共用的，`>` 带 O_TRUNC，随便谁跑一次 zh-voice 就把
-      # 正在跑的那个 daemon 的日志抹平了——而那是它当初为什么死掉的唯一记录
+      rm -f "$SOCK"                                # stale socket of a dead daemon
+      # Write the log to $TMPDIR. /tmp is shared by all users, and `>` truncates
+      # (O_TRUNC), so any zh-voice run would wipe the log of the running daemon.
+      # That log is the only record of why a daemon died.
       LOG_DIR="${TMPDIR:-/tmp}"
       (nohup "$HOME/.local/bin/zh-voice-daemon" >"${LOG_DIR%/}/zh-voice-daemon.log" 2>&1 &)
     fi
@@ -495,7 +532,7 @@ transcribe() {
   TRANSCRIBE_MS="$_ms"
 }
 
-transcribe "$CONTEXT"                              # SOCK 在 --health 那段之前就定好了
+transcribe "$CONTEXT"                              # SOCK is set before the --health section
 RAW="$TRANSCRIBE_OUT"
 M_ASR_MS="${TRANSCRIBE_MS:-?}"
 
@@ -506,23 +543,31 @@ if [ -z "$RAW" ]; then
   exit 1
 fi
 
-# ── 术语表回声：VAD 之后的第二道网 ──────────────────────────────────────────
-# 上面的闸门是 fail-open 的（检测器坏了/模型缓存没了就照常转写），所以泄漏那条路
-# 并没有被完全堵死。这一层不花钱：把转写和术语表都归一化（去空白、全角标点转半角、
-# 去掉 "技术术语：" 这种前置标签、去掉句末句号），如果转写正好是术语表的**前缀**，
-# 那它就不是人说的话——模型是在照着 context 念，而且被 max token 截断了。
-# 实测的四种泄漏输出全部命中，「嗯。」「啪啪啪。」这类不命中（长度门槛 + 不是前缀）。
-# 命中时和静音走同一个契约：exit 0 不输出，界面显示"没听清"。
-# （normalize_echo 和术语表的参照串 WANT 都在上面 CONTEXT 那段算好/读缓存了。）
+# ── Term-list echo: second net after the VAD ───────────────────────────────
+# The gate above fails open (a broken detector or a missing model cache still
+# transcribes), so the leak path is not fully closed. This layer costs nothing.
+# It normalizes the transcript and the term list (delete whitespace, convert
+# full-width punctuation to half-width, strip a leading label such as
+# "技术术语：", strip the final period). If the transcript is a PREFIX of the
+# term list, it is not human speech: the model recited the context and the
+# max-token limit cut it.
+# All four measured leak outputs match. "嗯。" and "啪啪啪。" do not match
+# (length threshold, not a prefix).
+# A match follows the silence contract: exit 0, no output, the UI shows
+# "not heard".
+# (normalize_echo and the reference string WANT are computed or read from the
+# cache in the CONTEXT section above.)
 #
-# 判据二（2026-07-29 加）：**不是前缀、但内容大部分直接来自术语表** —— 模型在乱序照念，
-# 或者只念了中间一截。条件刻意收得很紧，宁可漏也别把真话当成泄漏丢掉：
-#   · 归一化后 ≥12 字（「嗯。」这种根本不参与）
-#   · 逗号分隔后 ≥3 段，且其中 ≥3 段是术语表里的原词
-#   · 命中的那些段，字数要占到总字数的 ≥75%
+# Criterion 2: the transcript is not a prefix but mostly consists of terms from
+# the list. The model recites them in another order, or only a middle part. The
+# conditions are tight on purpose: a missed echo is better than a dropped real
+# utterance.
+#   - at least 12 characters after normalization ("嗯。" never takes part)
+#   - at least 3 comma-separated parts, and at least 3 of them are exact terms
+#   - the matching parts make up at least 75% of the total characters
 echo_coverage_hit() {
   _got="$1"; _want="$2"
-  case "$_got" in *,*) : ;; *) return 1 ;; esac      # 连逗号都没有，不像清单
+  case "$_got" in *,*) : ;; *) return 1 ;; esac      # no comma: not a list
   _total=0; _hit=0; _parts=0; _hitparts=0
   _ifs_save="$IFS"; IFS=','
   for _p in $_got; do
@@ -537,11 +582,14 @@ echo_coverage_hit() {
     && [ $(( _hit * 100 / _total )) -ge 75 ]
 }
 
-# 判据三（2026-08-14 加）：**真话说完，术语表整段贴在后面**（或反过来贴在前面）。
-# 这种混合输出判据一（不是前缀）和判据二（真话把覆盖率稀释到 75% 以下）都拦不住
-# ——实测泄漏过一次：10.8s 语音出 582 字，命中率 ~68%，整段照粘。
-# 回声的形态是**成片**的：只看两端各自的连续术语段，连续 ≥3 段且累计 ≥60 字才算。
-# 人在真话里连报三个术语（"LIBERO、RoboCasa、MIKASA"）到不了 60 字，整份表有几百字。
+# Criterion 3: real speech followed by the whole term list (or the reverse).
+# Criterion 1 (not a prefix) and criterion 2 (real speech dilutes coverage
+# below 75%) miss this mixed output. Example: 10.8 s of speech produced 582
+# characters at ~68% coverage, and the whole text was pasted.
+# An echo is a contiguous block. Check only the consecutive term run at each
+# end: at least 3 parts and at least 60 characters in total. A person who names
+# three terms in a row ("LIBERO、RoboCasa、MIKASA") does not reach 60
+# characters. The whole list has several hundred.
 echo_edge_run_hit() {
   _got="$1"; _want="$2"
   case "$_got" in *,*) : ;; *) return 1 ;; esac
@@ -565,23 +613,32 @@ echo_edge_run_hit() {
     || { [ "$_run_p" -ge 3 ] && [ "$_run_c" -ge 60 ]; }
 }
 
-# 判据四（2026-10-14 加）：**解码陷进循环**，同一截话首尾相接重复到撑满 token 上限。
-# 实测 mlx-qwen3-asr 0.4.4 + 生产 context：句尾「DeepStack，用的那个 AdaLN-Zero，
-# cross-attention，flow，matching，」循环到 1091 字，三条回声判据全不命中（循环单元里只有
-# 一半是术语，且不贴边成片），整段会被粘出去。
-# 条件：某个 ≥4 字的单元连续出现 ≥3 次，且重复的这一截 ≥30 字。人说话的重复
-# （「只有两百个，只有两百个，只有两百个」18 字、「对对对对」单元 1 字）到不了。
-# 已知误判边界：一句 ≥10 字的话原样连说三遍也会命中（重试同样命中 ⇒ 整句丢掉）。
-# perl 而不是 sed/awk：要反向引用，且要按字符而不是字节算长度（-CSA）。
-# ≥30 字的条件写在正则里（不满足就 *FAIL 回溯）：放到匹配之后判，/g 会把一段短重复
-# 吃掉，同一位置更长的单元就再也试不到了。`--`：转写以 "-" 开头时别被当成 perl 选项。
+# Criterion 4: the decoding falls into a loop. The same segment repeats end to
+# end until the token limit. Measured with mlx-qwen3-asr 0.4.4 and the
+# production context: a sentence ending "DeepStack，用的那个 AdaLN-Zero，
+# cross-attention，flow，matching，" looped to 1091 characters. The three echo
+# criteria do not match it (only half of the loop unit consists of terms, and
+# it is not a contiguous edge block), so the whole text would be pasted.
+# Condition: a unit of at least 4 characters repeats at least 3 times in a row,
+# and the repeated part has at least 30 characters. Human repetition does not
+# reach this ("只有两百个，只有两百个，只有两百个" has 18 characters; "对对对对"
+# has a 1-character unit).
+# Known false positive: a sentence of at least 10 characters said three times
+# unchanged also matches (the retry matches too, so the whole sentence is dropped).
+# Use perl, not sed/awk: the check needs a back-reference and a length in
+# characters, not bytes (-CSA).
+# The 30-character condition is in the regex (*FAIL backtracks). If checked
+# after the match, /g would consume a short repeat and a longer unit at the
+# same position would never be tried. `--` stops a transcript that starts with
+# "-" from being read as a perl option.
 echo_loop_hit() {
   perl -CSA -e '$_ = shift; exit(/((.{4,}?)\2{2,})(?(?{ length($1) < 30 })(*FAIL))/ ? 0 : 1)' -- "$1"
 }
 
-# 归一化 + 剥掉 "技术术语:" 这类前置标签。**必须两处共用**：第一次转写和重试结果
-# 走的不是同一段代码时，很容易只给其中一个剥标签——那样重试那份会因为多了 5 个字的
-# 标签把覆盖率稀释到 75% 以下，一份纯回声就被当成"干净结果"放出去了（测试抓到过）。
+# Normalize and strip a leading label such as "技术术语:". The first
+# transcription and the retry result MUST share this function. If only one of
+# them stripped the label, the 5-character label would dilute the coverage of a
+# pure echo below 75%, and the echo would pass as a clean result.
 canon_reply() {
   _c="$(normalize_echo "$1" "${2:-}")"
   _label="${_c%%:*}"
@@ -589,48 +646,55 @@ canon_reply() {
   printf '%s' "$_c"
 }
 
-# ${#RAW} 是预筛：GOT 是 RAW 去掉标点空白之后的东西，只会更短，所以 RAW 不足 12
-# 就不可能过下面那道 ≥12 的门槛——短句因此省掉 canon_reply 的三次 spawn。
-# （多字节下 ${#} 若按字节算只会更宽松，不会误筛掉该查的。）
-# 不再要求 TERMS 非空：循环不依赖术语表。TERMS 为空时 WANT 也为空，判据一到三自然
-# 不命中；循环命中后的重试和第一次相同，同样循环 ⇒ 丢弃，不会粘出去。
+# ${#RAW} is a pre-filter. GOT is RAW without punctuation and whitespace, so it
+# is never longer. A RAW below 12 characters cannot pass the 12-character
+# threshold below, and short sentences skip the three spawns of canon_reply.
+# (If ${#} counts bytes in a multibyte locale, the filter only becomes looser
+# and never skips a text that needs the check.)
+# TERMS does not need to be non-empty: the loop check does not use the term
+# list. With empty TERMS, WANT is empty and criteria 1 to 3 never match. After
+# a loop match, the retry loops the same way and the text is dropped, not pasted.
 if [ "${#RAW}" -ge 12 ]; then
   GOT="$(canon_reply "$RAW")"
   SUSPECT=0
   if [ "${#GOT}" -ge 12 ]; then
-    # ${WANT#"$GOT"} 里的引号让它按**字面**去前缀，不会把术语里的字符当通配符
-    [ "${WANT#"$GOT"}" != "$WANT" ] && SUSPECT=1                 # 判据一：前缀
-    echo_coverage_hit "$GOT" "$WANT" && SUSPECT=1                # 判据二：覆盖率
-    echo_edge_run_hit "$GOT" "$WANT" && SUSPECT=1                # 判据三：贴边成片
-    # 按空白切段的参照串只在这里用到，不进缓存（缓存格式不变）；长句才付这一次 spawn。
-    # 空白模式只接判据三、不接判据二：中文单字段短、英文术语段长，「用 Claude Code 跑
-    # speculative decoding」这类真话的覆盖率就过 75%，重试后仍命中会被整句丢掉。
+    # The quotes in ${WANT#"$GOT"} make the prefix removal literal, so term characters are not globs
+    [ "${WANT#"$GOT"}" != "$WANT" ] && SUSPECT=1                 # criterion 1: prefix
+    echo_coverage_hit "$GOT" "$WANT" && SUSPECT=1                # criterion 2: coverage
+    echo_edge_run_hit "$GOT" "$WANT" && SUSPECT=1                # criterion 3: edge run
+    # The whitespace-split reference string is used only here and is not cached
+    # (the cache format stays the same). Only long sentences pay this spawn.
+    # The whitespace mode feeds criterion 3 only, not criterion 2. Chinese parts
+    # are short and English term parts are long, so a real sentence such as
+    # "用 Claude Code 跑 speculative decoding" exceeds 75% coverage and would be
+    # dropped after the retry.
     WANT_WS="$(normalize_echo "$TERMS" ws)"
-    echo_edge_run_hit "$(canon_reply "$RAW" ws)" "$WANT_WS" && SUSPECT=1   # 判据三，按空白切段
-    echo_loop_hit "$GOT" && SUSPECT=1                            # 判据四：循环
+    echo_edge_run_hit "$(canon_reply "$RAW" ws)" "$WANT_WS" && SUSPECT=1   # criterion 3, whitespace split
+    echo_loop_hit "$GOT" && SUSPECT=1                            # criterion 4: loop
   fi
   if [ "$SUSPECT" = 1 ]; then
-    # 不再直接丢。先**不带 context** 重转一次：闸门是 fail-open 的，底下真有可能有话，
-    # 只是被术语偏置盖过去了。只有这一次重试，且只在已经判定可疑时才发生——
-    # 正常每次转写不会因此变慢。
+    # Do not drop at once. First transcribe again WITHOUT context. The gate fails
+    # open, so real speech may exist and the term bias may have covered it. This
+    # one retry happens only for a suspect result, so normal transcriptions do
+    # not slow down.
     M_RETRY=1
     transcribe ""
     RAW2="$TRANSCRIBE_OUT"
-    # 两次都得有服务端数字才能相加；缺一个就整行记 ?，别报一个只算了一半的数。
+    # Both runs need a server number to add them. If one is missing, record ? for the whole line, not a half sum.
     if [ "$M_ASR_MS" != "?" ] && [ -n "${TRANSCRIBE_MS:-}" ]; then
       M_ASR_MS=$((M_ASR_MS + TRANSCRIBE_MS))
     else
       M_ASR_MS="?"
     fi
-    GOT2="$(canon_reply "$RAW2")"        # 同一套归一化，标签也要剥
+    GOT2="$(canon_reply "$RAW2")"        # same normalization, label stripped too
     if [ -n "$RAW2" ] && [ "${#GOT2}" -ge 2 ] \
        && [ "${WANT#"$GOT2"}" = "$WANT" ] && ! echo_coverage_hit "$GOT2" "$WANT" \
        && ! echo_edge_run_hit "$GOT2" "$WANT" \
        && ! echo_edge_run_hit "$(canon_reply "$RAW2" ws)" "$WANT_WS" \
        && ! echo_loop_hit "$GOT2"; then
-      RAW="$RAW2"                        # 干净的那一版，用它
+      RAW="$RAW2"                        # the clean version: use it
     else
-      # 两次都是回声 → 和静音同一个契约：exit 0、不输出，界面显示"没听清"
+      # Both runs are echoes: same contract as silence (exit 0, no output, the UI shows "not heard")
       metric "echo_dropped=1 retry=1 path=$M_PATH asr_ms=$M_ASR_MS audio_ms=${M_AUDIO_IN:-?} vad_p=${M_VAD_P:-?}"
       exit 0
     fi
@@ -651,11 +715,14 @@ FINAL="${FINAL//$'\n'/ }"
 FINAL="${FINAL#"${FINAL%%[![:space:]]*}"}"
 FINAL="${FINAL%"${FINAL##*[![:space:]]}"}"
 
-# ── 本地语料存档（opt-in：`touch ~/.config/zh-voice/corpus`）────────────────────
-# 给 ASR 后训练攒「音频 + 转写」对。只存在本机，不上传。存的是 VAD 裁剪后的 in.wav
-# （模型实际听到的那份）、最终输出、发给模型的 context。上面 metrics 那段「不记音频
-# 和文本」的约定对默认路径照旧成立：没有开关文件就一个字节都不写。
-# 存档失败绝不能吃掉这一轮的输出：每一步都 `|| true`，且在打印结果之前只做本地 cp。
+# ── Local corpus archive (opt-in: `touch ~/.config/zh-voice/corpus`) ────────
+# Collect audio and transcript pairs for ASR post-training. They stay on this
+# machine and are never uploaded. The archive holds the in.wav after VAD trim
+# (what the model heard), the final output and the context sent to the model.
+# The "no audio or text in metrics" rule above still holds on the default path:
+# without the flag file, no byte is written.
+# An archive failure must not swallow the output of this turn. Every step ends
+# with `|| true`, and before the result is printed only a local cp runs.
 CORPUS_FLAG="${ZH_VOICE_CORPUS_FLAG:-$HOME/.config/zh-voice/corpus}"
 CORPUS_DIR="${ZH_VOICE_CORPUS_DIR:-$HOME/.local/share/zh-voice/corpus}"
 if [ -e "$CORPUS_FLAG" ]; then

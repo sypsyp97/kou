@@ -17,10 +17,12 @@ import sys
 import time
 import types
 
-# 复刻真包的结构：`transcribe` 既是**子模块**，又被包的 __init__ re-export 成同名函数。
-# daemon 的 pin_tokenizer_dir 必须从 sys.modules 拿模块（`import pkg.transcribe as T` 会
-# 拿到那个函数，往它身上设属性是静默失效），所以 stub 也得摆成同一个形状，否则测试测的
-# 就不是真实结构。
+# Copy the structure of the real package: `transcribe` is both a submodule and a
+# function of the same name that the package __init__ re-exports. The daemon
+# pin_tokenizer_dir must take the module from sys.modules (`import pkg.transcribe
+# as T` returns the function, and setting an attribute on it silently has no
+# effect). The stub needs the same shape, or the tests do not exercise the real
+# structure.
 _transcribe_module = types.ModuleType("mlx_qwen3_asr.transcribe")
 _transcribe_module.DEFAULT_MODEL_ID = "Qwen/Qwen3-ASR-0.6B"
 sys.modules["mlx_qwen3_asr.transcribe"] = _transcribe_module
@@ -74,8 +76,9 @@ def _record(path, context):
         fh.write(json.dumps({"path": os.path.realpath(str(path)),
                              "raw": str(path),
                              "context": context or "",
-                             # 这一次转写**实际**会去哪儿找词表。真包在这一刻读的就是
-                             # 这个模块属性（transcribe.py 的 _resolve_model_components）。
+                             # Where this transcription actually looks for the tokenizer.
+                             # The real package reads this module attribute at this point
+                             # (_resolve_model_components in transcribe.py).
                              "tokenizer_from": _transcribe_module.DEFAULT_MODEL_ID}) + "\n")
 
 
@@ -141,8 +144,9 @@ def transcribe(path, model=None, context=None, language=None, **kw):
         raise RuntimeError("stub ASR blew up on " + str(path))
     hang_on = os.environ.get("STUB_ASR_HANG_ON")
     if hang_on and hang_on in str(path):
-        # 站位一次卡死的 Metal 调用。真货卡在 C 里，Python 层的信号和异常都递不进去；
-        # 这里睡多久都一样，因为唯一的出路是从另一根线程 os._exit。
+        # Stand-in for a hung Metal call. The real call hangs in C, and no Python
+        # signal or exception can reach it. The sleep length does not matter,
+        # because the only way out is os._exit from another thread.
         while True:
             time.sleep(3600)
     if not path or not os.path.exists(path):

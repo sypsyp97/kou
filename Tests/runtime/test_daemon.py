@@ -84,8 +84,10 @@ def test_stale_socket_file_is_removed_and_bind_succeeds(daemon_factory):
 def test_malformed_request_gets_error_line_and_server_stays_alive(daemon_factory):
     """Protocol: 2 lines in; `META asr_ms=<n>` then exactly one transcript line out.
 
-    转写本身**必须**是最后一行且只有一行——zh-voice 靠 `${_raw##*\\n}` 取它。
-    ERROR 回复不带 META（客户端拿最后一行判 ERROR: 前缀，多一行头信息就判不出）。
+    The transcript MUST be the last line and the only transcript line: zh-voice
+    extracts it with `${_raw##*\\n}`. An ERROR reply carries no META line: the client
+    checks the last line for the ERROR: prefix, and an extra header line would
+    hide it.
 
     Three ways a client can misbehave, none of which may take the resident
     model down with it:
@@ -239,26 +241,31 @@ def test_idle_timeout_off_keeps_the_model_resident(daemon_factory):
 # --- 36 ------------------------------------------------------------------
 def test_wedged_transcription_makes_the_daemon_exit_so_launchd_replaces_it(
         daemon_factory):
-    """"进程活着、服务已死"必须有出口。
+    """A process that is alive while its service is dead must have a way out.
 
-    MLX/Metal 卡住时进程在、socket 在，launchd 的 KeepAlive 只看进程存在，判断不出
-    任何异常；而 accept 循环是单线程的，从此每次按键都要先白等客户端 nc 的 90 s 超时
-    才退回一次性 CLI。唯一的自愈手段是 daemon 自己认账退出，让 launchd 换一个上来。
+    When MLX/Metal hangs, the process and the socket still exist. launchd
+    KeepAlive only checks that the process exists, so it sees nothing wrong. The
+    accept loop is single-threaded, so every key press first waits for the 90 s nc
+    timeout of the client before it falls back to the one-shot CLI. The only
+    self-healing step is that the daemon admits the failure and exits, so that
+    launchd starts a new one.
 
-    这条也钉住"看门狗不能跟 ZH_VOICE_IDLE 绑在一起"：线上 plist 正是 IDLE=0，要是绑了，
-    唯一的自愈手段就恰好在唯一需要它的配置下失效。
+    This test also pins that the watchdog must not depend on ZH_VOICE_IDLE. The
+    production plist uses IDLE=0. If the watchdog depended on it, the only
+    self-healing step would fail in the one configuration that needs it.
     """
     d = daemon_factory(env_extra={
         "STUB_ASR_HANG_ON": "wedge",
-        "ZH_VOICE_IDLE": "0",           # 线上就是这个模式
+        "ZH_VOICE_IDLE": "0",           # the production mode
         "ZH_VOICE_HANG_FLOOR": "1",
         "ZH_VOICE_HANG_CEIL": "1",
     })
     wav = write_wav(d.tmp / "wedge.wav", 0.5)
 
-    # 客户端必须先拿到一句 ERROR，再看到 daemon 退出。这个顺序是有用户价值的：
-    # zh-voice 见到 ERROR 就立刻退回一次性 CLI，这句话照样出字；要是 daemon 直接
-    # 死掉，客户端只能白等满 nc 的 90s 超时才反应过来。
+    # The client must receive an ERROR first and only then see the daemon exit.
+    # This order matters to the user: zh-voice falls back to the one-shot CLI at
+    # once on ERROR, and the utterance is still transcribed. If the daemon just
+    # died, the client would wait for the full 90 s nc timeout.
     reply = d.transcribe(str(wav), timeout=20)
 
     assert reply.startswith("ERROR:"), (
@@ -281,10 +288,11 @@ def test_wedged_transcription_makes_the_daemon_exit_so_launchd_replaces_it(
 
 # --- 37 ------------------------------------------------------------------
 def test_ping_is_answered_without_touching_the_model(daemon_factory):
-    """健康探针要测的是"accept 循环还转不转"，所以它不能自己去跑一次转写。
+    """The health probe tests whether the accept loop still runs, so it must not run a transcription itself.
 
-    卡死在 MLX 里的 daemon 根本读不到这个请求（那次转写正占着唯一的线程），所以
-    "PING 收不到 PONG"本身就是死亡证明——比 pgrep 准，pgrep 数得到僵尸。
+    A daemon that hangs in MLX cannot read this request at all (the transcription
+    occupies the only thread). So "no PONG for a PING" is itself proof of death,
+    and it is more accurate than pgrep, which also counts zombies.
     """
     d = daemon_factory()
     before = len(d.asr_calls())
@@ -309,15 +317,17 @@ def test_ping_is_answered_without_touching_the_model(daemon_factory):
 
 # --- 46 ------------------------------------------------------------------
 def test_the_model_lives_in_a_separate_process_from_the_socket(daemon_factory):
-    """模型不能和 socket 住在同一个进程里。
+    """The model must not live in the same process as the socket.
 
-    一次 Metal 调用可以挂住而不杀死 Python。如果推理跑在 socket 进程里，唯一的自救手段
-    就是一根看门狗线程去 os._exit——而那根线程能不能被调度，取决于卡死的 C 调用有没有
-    释放 GIL。这个前提不该由我们来赌：把 MLX 关进子进程之后，父进程从头到尾不碰 Metal，
-    它一定还卡得动死线。
+    A Metal call can hang without killing Python. If inference ran in the socket
+    process, the only recovery would be a watchdog thread that calls os._exit, and
+    whether that thread gets scheduled depends on whether the hung C call releases
+    the GIL. Do not rely on that. With MLX in a child process, the parent never
+    touches Metal and can always enforce the deadline.
 
-    两头都查：真的有子进程（行为），且 mlx 不在父进程的模块顶层 import（防止哪天被
-    "简化"回去，那种回归不会让任何别的测试变红）。
+    Check both sides: a child process exists (behavior), and mlx is not imported
+    at module level in the parent (so that a later "simplification" is caught;
+    no other test would fail on that regression).
     """
     d = daemon_factory()
 
@@ -339,10 +349,11 @@ def test_the_model_lives_in_a_separate_process_from_the_socket(daemon_factory):
 
 # --- 47 ------------------------------------------------------------------
 def test_empty_transcript_is_retried_without_the_term_bias(daemon_factory):
-    """一整行术语表是很强的先验，撞上短句可能把输出整个压没。
+    """A full term-list line is a strong prior and can suppress the whole output of a short utterance.
 
-    空结果对用户等于"这句话白说了"，所以要退一步不带 context 再问一次——只在本来就要
-    交白卷的那条路上多花一次。
+    An empty result means the user spoke for nothing, so ask once more without the
+    context. This costs one extra run only on a path that would otherwise return
+    nothing.
     """
     d = daemon_factory(env_extra={"STUB_ASR_EMPTY_WITH_CONTEXT": "1"})
     wav = write_wav(d.tmp / "clip.wav", 0.5)
@@ -360,15 +371,16 @@ def test_empty_transcript_is_retried_without_the_term_bias(daemon_factory):
     assert not calls[1]["context"], "重试那次必须不带术语表，否则重试没有意义"
 
 
-# --- 75 --- 2026-07-29：钉死的 revision 必须在**运行期**生效 ----------------
+# --- 75 --- the pinned revision must take effect at run time ---------------
 def test_pinned_snapshot_path_is_what_actually_gets_loaded(daemon_factory, tmp_path):
-    """只把 repo id 交给 load_model 是钉不住版本的。
+    """Passing only the repo id to load_model does not pin the version.
 
-    离线模式下 huggingface_hub 去读 refs/main —— "缓存里最近一次拉到的那一版"。上游更新
-    过一次，它和我们钉的 ASR_REVISION 就是两份不同的权重，而 deploy 的预检（只查那个目录
-    还在不在）照样通过。症状是"转写忽然变差"，属于最难查的那一类。
-    所以要把那个 snapshot 的**路径**交给它，并且把真正加载的来源回显在 PONG 里，
-    好让 deploy 拿它对账。
+    In offline mode huggingface_hub reads refs/main, which is the most recently
+    fetched snapshot in the cache. After an upstream update it differs from the
+    pinned ASR_REVISION, and the install pre-check (which only checks that the
+    directory exists) still passes. The only symptom is worse transcription, which
+    is hard to diagnose. So pass the PATH of the snapshot, and echo the real
+    source of the loaded model in PONG so that the install check can compare it.
     """
     snap = tmp_path / "snapshots" / ("b" * 40)
     snap.mkdir(parents=True)
@@ -385,12 +397,15 @@ def test_pinned_snapshot_path_is_what_actually_gets_loaded(daemon_factory, tmp_p
 
 def test_an_unusable_pin_says_unpinned_out_loud_instead_of_pretending(
         daemon_factory, tmp_path):
-    """钉死的路径填了却用不上（snapshot 被 delete-cache 掏空了），行为是退回 repo id ——
-    照样出字，只是出的是另一份权重的字。这种**静默**的漂移正是要避免的东西，所以两处都要
-    说出来：日志里一行警告，PONG 里 rev=unpinned（而不是假装钉住了）。deploy 拿后者当死线。
+    """A pinned path is set but unusable (for example the snapshot was emptied by delete-cache). The behavior is a fallback to the repo id.
+
+    The daemon still transcribes, but with other weights. This silent drift is
+    what the pin must prevent, so the daemon reports it in two places: a warning
+    line in the log, and rev=unpinned in PONG (it does not pretend to be pinned).
+    The install check uses the PONG value as its deadline.
     """
     empty = tmp_path / "snapshots" / ("c" * 40)
-    empty.mkdir(parents=True)                      # 目录在，config.json 不在
+    empty.mkdir(parents=True)                      # the directory exists, config.json does not
 
     d = daemon_factory(env_extra={"ZH_VOICE_MODEL_PATH": str(empty)})
     reply = d.request("PING\n\n")
@@ -402,13 +417,15 @@ def test_an_unusable_pin_says_unpinned_out_loud_instead_of_pretending(
         "退回 repo id 这件事在日志里一个字都没有：%r" % (log[:400],))
 
 
-# --- 77 --- 2026-07-29：词表也必须来自我们钉的 snapshot ---------------------
+# --- 77 --- the tokenizer must also come from the pinned snapshot -------------
 def test_tokenizer_is_pinned_to_the_snapshot_we_loaded(daemon_factory, tmp_path):
-    """词表原来不受我们的 revision 约束，来自上游 DEFAULT_MODEL_ID 那个仓库。
+    """Without a pin, the tokenizer comes from the upstream DEFAULT_MODEL_ID repo and ignores our revision.
 
-    实测（HF_HOME 指向空目录 + HF_HUB_OFFLINE=1）：不钉的话连一次转写都跑不出来
-    （LocalEntryNotFoundError），钉上之后同样的环境里正常出字 —— 也就是说钉住之后
-    那个上游仓库的缓存（本机 1.7 GB，99% 是我们从不加载的 0.6B 权重）**真的不再需要**。
+    Measured with HF_HOME pointing to an empty directory and HF_HUB_OFFLINE=1:
+    without the pin, no transcription runs (LocalEntryNotFoundError). With the pin,
+    the same environment transcribes normally. So with the pin, the cache of the
+    upstream repo (1.7 GB locally, 99% of it 0.6B weights that are never loaded)
+    is not needed.
     """
     snap = tmp_path / "snapshots" / ("e" * 40)
     snap.mkdir(parents=True)
@@ -429,12 +446,15 @@ def test_tokenizer_is_pinned_to_the_snapshot_we_loaded(daemon_factory, tmp_path)
 
 def test_an_unpinnable_target_says_upstream_instead_of_pretending(
         daemon_factory, tmp_path):
-    """钉不住时（钉的那份 snapshot 不带词表文件，或上游换了结构）必须如实说 upstream：
-    deploy 会据此退回去要求上游仓库存在、且词表和我们钉的逐字节一致。假装钉住了，
-    那条兜底就被跳过，而线上其实在用另一个仓库的词表。"""
+    """If the pin is not possible (the pinned snapshot has no tokenizer files, or upstream changed its structure), report upstream.
+
+    The install check then requires the upstream repo to exist with a tokenizer
+    that is byte-identical to the pinned one. If the daemon pretended to be
+    pinned, that fallback check would be skipped while the daemon uses the
+    tokenizer of another repo."""
     snap = tmp_path / "snapshots" / ("f" * 40)
     snap.mkdir(parents=True)
-    (snap / "config.json").write_text("{}", encoding="utf-8")   # 只有权重，没有词表文件
+    (snap / "config.json").write_text("{}", encoding="utf-8")   # weights only, no tokenizer files
 
     d = daemon_factory(env_extra={"ZH_VOICE_MODEL_PATH": str(snap)})
     reply = d.request("PING\n\n")
@@ -446,14 +466,16 @@ def test_an_unpinnable_target_says_upstream_instead_of_pretending(
 
 
 def test_the_pin_uses_the_module_from_sys_modules_not_the_reexported_function():
-    """`import mlx_qwen3_asr.transcribe as T` 拿到的是**函数**（包的 __init__ re-export 了
-    同名函数），给它设属性是往函数对象上挂一个没人读的字段 —— 静默失效，实测踩过一次。
-    唯一可靠的句柄是 sys.modules["mlx_qwen3_asr.transcribe"]。"""
+    """`import mlx_qwen3_asr.transcribe as T` returns the FUNCTION (the package __init__ re-exports a function of the same name).
+
+    Setting an attribute on it adds a field that nobody reads, and fails
+    silently. The only reliable handle is sys.modules["mlx_qwen3_asr.transcribe"].
+    """
     code = ZH_VOICE_DAEMON.read_text(encoding="utf-8")
     body = re.search(r"def pin_tokenizer_dir\(target\):(.*?)\ndef ", code, re.S)
     assert body, "找不到 pin_tokenizer_dir"
-    # 只看真正会执行的那几行：docstring 里**故意**写着那个错误写法当警告，连它一起匹配
-    # 的话这条断言就恒红（第一版就是这么红的）。
+    # Look only at the lines that execute. The docstring deliberately contains the
+    # wrong form as a warning, and matching it would make this assertion always fail.
     statements = body.group(1).split('"""')[-1]
     assert "sys.modules" in statements, (
         "钉子没走 sys.modules，那它大概率钉在了 re-export 出来的那个函数身上")
